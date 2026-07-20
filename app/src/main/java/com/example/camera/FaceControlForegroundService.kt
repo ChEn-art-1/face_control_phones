@@ -6,16 +6,12 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
-<<<<<<< HEAD
 import android.os.Build
 import android.os.IBinder
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 import android.widget.Toast
-=======
-import android.os.IBinder
->>>>>>> e46afea8527987e1b8151d4c41ad95606d0f8fce
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -28,12 +24,14 @@ import java.util.concurrent.Executors
 class FaceControlForegroundService : LifecycleService() {
 
     private lateinit var cameraExecutor: ExecutorService
-<<<<<<< HEAD
     private var cameraProvider: ProcessCameraProvider? = null
 
     // 屏幕尺寸，用于百分比坐标换算
     private var screenWidth = 1080
     private var screenHeight = 2400
+
+    // 保存 analyzer 引用以便在 onDestroy 中释放
+    private var faceAnalyzer: FaceAnalyzer? = null
 
     companion object {
         private const val TAG = "FaceControlService"
@@ -41,13 +39,10 @@ class FaceControlForegroundService : LifecycleService() {
         private const val NOTIFICATION_ID = 1
         private const val ERROR_NOTIFICATION_ID = 2
     }
-=======
->>>>>>> e46afea8527987e1b8151d4c41ad95606d0f8fce
 
     override fun onCreate() {
         super.onCreate()
         cameraExecutor = Executors.newSingleThreadExecutor()
-<<<<<<< HEAD
         updateScreenSize()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification())
@@ -82,28 +77,11 @@ class FaceControlForegroundService : LifecycleService() {
         val channelName = "Face Control Service"
         val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(CHANNEL_ID, channelName, NotificationManager.IMPORTANCE_LOW)
-=======
-        createNotificationChannel()
-        startForeground(1, createNotification())
-        startCamera()
-    }
-
-    private fun createNotificationChannel() {
-        val channelId = "face_control_channel"
-        val channelName = "Face Control Service"
-        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        val channel = NotificationChannel(channelId, channelName, NotificationManager.IMPORTANCE_LOW)
->>>>>>> e46afea8527987e1b8151d4c41ad95606d0f8fce
         manager.createNotificationChannel(channel)
     }
 
     private fun createNotification(): Notification {
-<<<<<<< HEAD
         return NotificationCompat.Builder(this, CHANNEL_ID)
-=======
-        val channelId = "face_control_channel"
-        return NotificationCompat.Builder(this, channelId)
->>>>>>> e46afea8527987e1b8151d4c41ad95606d0f8fce
             .setContentTitle("FaceControl is active")
             .setContentText("Monitoring face gestures...")
             .setSmallIcon(R.mipmap.ic_launcher)
@@ -113,7 +91,6 @@ class FaceControlForegroundService : LifecycleService() {
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
-<<<<<<< HEAD
             try {
                 cameraProvider = cameraProviderFuture.get()
 
@@ -122,9 +99,16 @@ class FaceControlForegroundService : LifecycleService() {
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                     .build()
 
-                val analyzer = FaceAnalyzer(this) { action ->
-                    handleFaceAction(action)
-                }
+                // 创建 analyzer 时传入初始化失败回调
+                val analyzer = FaceAnalyzer(
+                    context = this,
+                    onActionDetected = { action -> handleFaceAction(action) },
+                    onInitFailed = { error ->
+                        Log.e(TAG, "人脸识别模型初始化失败", error)
+                        handleCameraFailure()
+                    }
+                )
+                faceAnalyzer = analyzer
 
                 imageAnalysis.setAnalyzer(cameraExecutor, analyzer)
 
@@ -135,33 +119,10 @@ class FaceControlForegroundService : LifecycleService() {
             } catch (e: Exception) {
                 Log.e(TAG, "摄像头启动失败", e)
                 handleCameraFailure()
-=======
-            val cameraProvider = cameraProviderFuture.get()
-
-            val imageAnalysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
-
-            val analyzer = FaceAnalyzer(this) { action ->
-                handleFaceAction(action)
-            }
-
-            imageAnalysis.setAnalyzer(cameraExecutor, analyzer)
-
-            val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-
-            try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, cameraSelector, imageAnalysis)
-            } catch (e: Exception) {
-                e.printStackTrace()
->>>>>>> e46afea8527987e1b8151d4c41ad95606d0f8fce
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-<<<<<<< HEAD
     /**
      * 摄像头打开失败时的处理：通知用户 + 停止服务
      */
@@ -173,8 +134,6 @@ class FaceControlForegroundService : LifecycleService() {
         ).show()
 
         showErrorNotification()
-
-        // 停止前台服务，触发 onDestroy 释放资源
         stopSelf()
     }
 
@@ -189,8 +148,6 @@ class FaceControlForegroundService : LifecycleService() {
         manager.notify(ERROR_NOTIFICATION_ID, notification)
     }
 
-=======
->>>>>>> e46afea8527987e1b8151d4c41ad95606d0f8fce
     private fun handleFaceAction(action: FaceAnalyzer.FaceAction) {
         val service = FaceAccessibilityService.instance ?: return
         val isPortrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
@@ -202,7 +159,6 @@ class FaceControlForegroundService : LifecycleService() {
         }
     }
 
-<<<<<<< HEAD
     // ------- 百分比坐标转换工具方法 -------
     private fun px(percentX: Float): Float = screenWidth * percentX
     private fun py(percentY: Float): Float = screenHeight * percentY
@@ -238,37 +194,12 @@ class FaceControlForegroundService : LifecycleService() {
             }
             FaceAnalyzer.FaceAction.NOD -> {
                 service.performClickAction(px(0.5f), py(0.5f))
-=======
-    private fun handlePortraitMode(action: FaceAnalyzer.FaceAction, service: FaceAccessibilityService) {
-        when (action) {
-            FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
-                // 原始方案：向上滑动
-                service.performSwipeAction(500f, 1500f, 500f, 500f)
-            }
-            FaceAnalyzer.FaceAction.SHAKE_LEFT -> {
-                // 左扭头 -> 向左滑动
-                service.performSwipeAction(900f, 1000f, 100f, 1000f)
-            }
-            FaceAnalyzer.FaceAction.SHAKE_RIGHT -> {
-                // 右扭头 -> 向右滑动
-                service.performSwipeAction(100f, 1000f, 900f, 1000f)
-            }
-            FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                service.startContinuousPress(500f, 1000f)
-            }
-            FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(500f, 1000f)
-            }
-            FaceAnalyzer.FaceAction.NOD -> {
-                service.performClickAction(500f, 1000f)
->>>>>>> e46afea8527987e1b8151d4c41ad95606d0f8fce
             }
             else -> {}
         }
     }
 
     private fun handleLandscapeMode(action: FaceAnalyzer.FaceAction, service: FaceAccessibilityService) {
-<<<<<<< HEAD
         when (action) {
             FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
                 // 双眨眼 -> 从左向右拖动 (快进)
@@ -289,24 +220,6 @@ class FaceControlForegroundService : LifecycleService() {
             }
             FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
                 service.stopContinuousPress(px(0.5f), py(0.5f))
-=======
-        // 横屏方案 (假设屏幕宽 2400, 高 1080)
-        when (action) {
-            FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
-                // 双眨眼 -> 从左向右拖动 (快进)
-                service.performSwipeAction(500f, 540f, 1900f, 540f)
-            }
-            FaceAnalyzer.FaceAction.NOD -> {
-                // 点头 -> 从右向左拖动 (倒退)
-                service.performSwipeAction(1900f, 540f, 500f, 540f)
-            }
-            FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                // 张嘴 -> 持续长按屏幕中心
-                service.startContinuousPress(1200f, 540f)
-            }
-            FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(1200f, 540f)
->>>>>>> e46afea8527987e1b8151d4c41ad95606d0f8fce
             }
             else -> {}
         }
@@ -314,7 +227,6 @@ class FaceControlForegroundService : LifecycleService() {
 
     override fun onDestroy() {
         super.onDestroy()
-<<<<<<< HEAD
         releaseResources()
     }
 
@@ -330,39 +242,22 @@ class FaceControlForegroundService : LifecycleService() {
             cameraProvider = null
         }
 
+        // 释放 FaceAnalyzer 资源
+        try {
+            faceAnalyzer?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "关闭 FaceAnalyzer 时出错", e)
+        } finally {
+            faceAnalyzer = null
+        }
+
         if (::cameraExecutor.isInitialized) {
             cameraExecutor.shutdown()
         }
-=======
-        cameraExecutor.shutdown()
->>>>>>> e46afea8527987e1b8151d4c41ad95606d0f8fce
     }
 
     override fun onBind(intent: Intent): IBinder? {
         super.onBind(intent)
         return null
     }
-<<<<<<< HEAD
 }
-
-// 1) 创建 analyzer 时传入初始化失败回调
-private var faceAnalyzer: FaceAnalyzer? = null
-
-// startCamera() 内：
-val analyzer = FaceAnalyzer(
-    context = this,
-    onActionDetected = { action -> handleFaceAction(action) },
-    onInitFailed = { error ->
-        Log.e(TAG, "人脸识别模型初始化失败", error)
-        handleCameraFailure()  // 复用上一轮的失败处理：Toast + 通知 + stopSelf
-    }
-)
-faceAnalyzer = analyzer
-imageAnalysis.setAnalyzer(cameraExecutor, analyzer)
-
-// 2) releaseResources() 内追加：
-faceAnalyzer?.close()
-faceAnalyzer = null
-=======
-}
->>>>>>> e46afea8527987e1b8151d4c41ad95606d0f8fce
