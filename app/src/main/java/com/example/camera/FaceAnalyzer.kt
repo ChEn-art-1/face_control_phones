@@ -16,8 +16,6 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
-import kotlin.math.pow
-import kotlin.math.sqrt
 
 /**
  * ============================================================
@@ -382,17 +380,22 @@ class FaceAnalyzer(
         l: List<NormalizedLandmark>,
         p1: Int, p2: Int, p3: Int, p4: Int, p5: Int, p6: Int
     ): Float {
-        val v1 = dist(l[p2], l[p6])
-        val v2 = dist(l[p3], l[p5])
-        val h = dist(l[p1], l[p4])
-        return if (h == 0f) 0f else (v1 + v2) / (2f * h)
+        return FaceMath.calculateEAR(
+            l[p1].x(), l[p1].y(),
+            l[p2].x(), l[p2].y(),
+            l[p3].x(), l[p3].y(),
+            l[p4].x(), l[p4].y(),
+            l[p5].x(), l[p5].y(),
+            l[p6].x(), l[p6].y(),
+        )
     }
 
     /**
-     * 计算两个关键点之间的欧氏距离
+     * 计算两个关键点之间的 2D 欧氏距离
+     * 委托给 FaceMath.dist() 实现，方便单测验证
      */
     private fun dist(a: NormalizedLandmark, b: NormalizedLandmark): Float =
-        sqrt((a.x() - b.x()).toDouble().pow(2.0) + (a.y() - b.y()).toDouble().pow(2.0)).toFloat()
+        FaceMath.dist(a.x(), a.y(), b.x(), b.y())
 
     // ============================================================
     // 资源释放
