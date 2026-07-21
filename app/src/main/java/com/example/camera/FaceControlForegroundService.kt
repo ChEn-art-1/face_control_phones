@@ -16,18 +16,58 @@ import androidx.lifecycle.LifecycleService
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+/**
+ * ============================================================
+ * 前台服务 + 调度中枢 — 本 App 的"大脑"
+ *
+ * 职责链：
+ *   CameraX (前置摄像头)
+ *       ↓ 逐帧
+ *   FaceAnalyzer (MediaPipe 人脸检测)
+ *       ↓ 识别出 FaceAction
+ *   当前方法 (判断横/竖屏，映射为具体手势)
+ *       ↓ 调用
+ *   FaceAccessibilityService (无障碍手势执行)
+ *       ↓
+ *   系统触摸事件 → 被控制 App 响应
+ * ============================================================
+ */
 class FaceControlForegroundService : LifecycleService() {
 
+    /** 相机分析运行在独立线程，不阻塞主线程 */
     private lateinit var cameraExecutor: ExecutorService
+
+    // ================================================================
+    // 生命周期
+    // ================================================================
 
     override fun onCreate() {
         super.onCreate()
         cameraExecutor = Executors.newSingleThreadExecutor()
+
+        // 1. 创建前台服务通知（系统必须，否则 Android 8+ 会崩溃）
         createNotificationChannel()
         startForeground(1, createNotification())
+
+        // 2. 启动 CameraX + 人脸检测流水线
         startCamera()
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()  // 释放相机线程
+    }
+
+    override fun onBind(intent: Intent): IBinder? {
+        super.onBind(intent)
+        return null  // 非绑定服务
+    }
+
+    // ================================================================
+    // 前台服务通知
+    // ================================================================
+
+    /** 创建通知渠道（Android 8+ 必须） */
     private fun createNotificationChannel() {
         val channelId = "face_control_channel"
         val channelName = "Face Control Service"
@@ -36,6 +76,7 @@ class FaceControlForegroundService : LifecycleService() {
         manager.createNotificationChannel(channel)
     }
 
+    /** 构建通知内容 */
     private fun createNotification(): Notification {
         val channelId = "face_control_channel"
         return NotificationCompat.Builder(this, channelId)
@@ -45,26 +86,43 @@ class FaceControlForegroundService : LifecycleService() {
             .build()
     }
 
+    // ================================================================
+    // CameraX 相机流水线
+    // ================================================================
+
+    /**
+     * 启动前置摄像头 + 人脸分析
+     *
+     * 流程：
+     *   1. 获取 ProcessCameraProvider（CameraX 的生命周期感知相机管理器）
+     *   2. 创建 ImageAnalysis 分析器（只保留最新帧，RGBA 格式）
+     *   3. 创建 FaceAnalyzer 并设置回调（拿到 FaceAction 就执行手势）
+     *   4. 绑定前置摄像头到当前 Lifecycle
+     */
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
 
+            // ----- 图像分析器配置 -----
             val imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                // 只处理最新帧，处理不过来就丢弃旧的（保证实时性）
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
 
+            // ----- 人脸分析器（核心算法模块） -----
             val analyzer = FaceAnalyzer(this) { action ->
-                handleFaceAction(action)
+                handleFaceAction(action)  // 检测到动作 → 执行手势
             }
 
             imageAnalysis.setAnalyzer(cameraExecutor, analyzer)
 
+            // ----- 选择前置摄像头 -----
             val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
 
             try {
-                cameraProvider.unbindAll()
+                cameraProvider.unbindAll()  // 先解绑所有用例
                 cameraProvider.bindToLifecycle(this, cameraSelector, imageAnalysis)
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -72,9 +130,18 @@ class FaceControlForegroundService : LifecycleService() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    // ================================================================
+    // 动作→手势 映射调度
+    // ================================================================
+
+    /**
+     * 收到 FaceAnalyzer 的人脸动作事件
+     * 先获取无障碍服务实例，再根据横/竖屏选择映射方案
+     */
     private fun handleFaceAction(action: FaceAnalyzer.FaceAction) {
-        val service = FaceAccessibilityService.instance ?: return
-        val isPortrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+        val service = FaceAccessibilityService.instance ?: return  // 无障碍服务未运行，跳过
+        val isPortrait =
+            resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
 
         if (isPortrait) {
             handlePortraitMode(action, service)
@@ -83,62 +150,80 @@ class FaceControlForegroundService : LifecycleService() {
         }
     }
 
-    private fun handlePortraitMode(action: FaceAnalyzer.FaceAction, service: FaceAccessibilityService) {
+    // ================================================================
+    // 方案一：竖屏手势映射
+    // 适用场景：刷短视频（抖音/TikTok）、翻页浏览
+    // 所有坐标通过 displayMetrics 动态计算，自适应不同分辨率
+    // ================================================================
+    private fun handlePortraitMode(
+        action: FaceAnalyzer.FaceAction,
+        service: FaceAccessibilityService
+    ) {
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels.toFloat()
+        val h = dm.heightPixels.toFloat()
+
         when (action) {
+            // 双眨眼 → 向上滑动（刷下一条视频/翻下一页）
             FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
-                // 原始方案：向上滑动
-                service.performSwipeAction(500f, 1500f, 500f, 500f)
+                service.performSwipeAction(w / 2f, h * 0.75f, w / 2f, h * 0.25f)
             }
+            // 左扭头 → 向左滑动（往回翻/退出）
             FaceAnalyzer.FaceAction.SHAKE_LEFT -> {
-                // 左扭头 -> 向左滑动
-                service.performSwipeAction(900f, 1000f, 100f, 1000f)
+                service.performSwipeAction(w * 0.8f, h / 2f, w * 0.15f, h / 2f)
             }
+            // 右扭头 → 向右滑动（前进/下一项）
             FaceAnalyzer.FaceAction.SHAKE_RIGHT -> {
-                // 右扭头 -> 向右滑动
-                service.performSwipeAction(100f, 1000f, 900f, 1000f)
+                service.performSwipeAction(w * 0.15f, h / 2f, w * 0.8f, h / 2f)
             }
+            // 张嘴 → 持续按压屏幕中心（触发长按菜单/加速）
             FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                service.startContinuousPress(500f, 1000f)
+                service.startContinuousPress(w / 2f, h / 2f)
             }
+            // 闭嘴 → 停止按压
             FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(500f, 1000f)
+                service.stopContinuousPress(w / 2f, h / 2f)
             }
+            // 点头 → 单次点击（选中/确认/暂停播放）
             FaceAnalyzer.FaceAction.NOD -> {
-                service.performClickAction(500f, 1000f)
+                service.performClickAction(w / 2f, h / 2f)
             }
-            else -> {}
+            else -> {}  // 单次眨眼在竖屏下无映射
         }
     }
 
-    private fun handleLandscapeMode(action: FaceAnalyzer.FaceAction, service: FaceAccessibilityService) {
-        // 横屏方案 (假设屏幕宽 2400, 高 1080)
+    // ================================================================
+    // 方案二：横屏手势映射
+    // 适用场景：看电影/视频（全屏播放器）
+    // 所有坐标通过 displayMetrics 动态计算，自适应不同分辨率
+    // ================================================================
+    private fun handleLandscapeMode(
+        action: FaceAnalyzer.FaceAction,
+        service: FaceAccessibilityService
+    ) {
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels.toFloat()
+        val h = dm.heightPixels.toFloat()
+
         when (action) {
+            // 双眨眼 → 从左向右拖动（快进）
             FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
-                // 双眨眼 -> 从左向右拖动 (快进)
-                service.performSwipeAction(500f, 540f, 1900f, 540f)
+                service.performSwipeAction(w * 0.2f, h / 2f, w * 0.8f, h / 2f)
             }
+            // 点头 → 从右向左拖动（倒退）
             FaceAnalyzer.FaceAction.NOD -> {
-                // 点头 -> 从右向左拖动 (倒退)
-                service.performSwipeAction(1900f, 540f, 500f, 540f)
+                service.performSwipeAction(w * 0.8f, h / 2f, w * 0.2f, h / 2f)
             }
+            // 张嘴 → 持续长按屏幕中心（触发播放器菜单/倍速）
             FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                // 张嘴 -> 持续长按屏幕中心
-                service.startContinuousPress(1200f, 540f)
+                service.startContinuousPress(w / 2f, h / 2f)
             }
+            // 闭嘴 → 停止按压
             FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(1200f, 540f)
+                service.stopContinuousPress(w / 2f, h / 2f)
             }
+            // 横屏下左右扭头暂不映射，避免与快进倒退混淆
             else -> {}
         }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        cameraExecutor.shutdown()
-    }
-
-    override fun onBind(intent: Intent): IBinder? {
-        super.onBind(intent)
-        return null
     }
 }
