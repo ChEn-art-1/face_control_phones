@@ -118,11 +118,10 @@ class FaceAnalyzer(
             return
         }
 
-        var originalBitmap: Bitmap? = null
-        var rotatedBitmap: Bitmap? = null
         try {
-            originalBitmap = image.toBitmap()
-            rotatedBitmap = if (image.imageInfo.rotationDegrees != 0) {
+            val originalBitmap = image.toBitmap()
+
+            val rotatedBitmap = if (image.imageInfo.rotationDegrees != 0) {
                 val matrix = Matrix().apply {
                     postRotate(image.imageInfo.rotationDegrees.toFloat())
                 }
@@ -136,16 +135,20 @@ class FaceAnalyzer(
             }
 
             val mpImage = BitmapImageBuilder(rotatedBitmap).build()
-            landmarker.detectAsync(mpImage, image.imageInfo.timestamp)
+
+            // 关键修改：将纳秒转换为毫秒
+            // image.imageInfo.timestamp 返回纳秒，MediaPipe 需要毫秒
+            val timestampMs = image.imageInfo.timestamp / 1_000_000
+            landmarker.detectAsync(mpImage, timestampMs)
+
+            // 不在此处回收 Bitmap。
+            // 因为 detectAsync 是异步的，MediaPipe 内部会在后台线程处理图像数据。
+            // 手动 recycle() 会导致后台线程访问已回收的内存，造成崩溃。
+            // Android 8.0+ 的 Bitmap 像素数据在 Native 堆，GC 会自动回收。
         } catch (e: Throwable) {
             Log.e(TAG, "analyze frame failed", e)
         } finally {
-            // 释放临时 bitmap，避免累积占用内存
-            // 注意：如果没有旋转，rotatedBitmap === originalBitmap，只 recycle 一次
-            if (rotatedBitmap != null && rotatedBitmap !== originalBitmap) {
-                rotatedBitmap.recycle()
-            }
-            originalBitmap?.recycle()
+            // 只释放 ImageProxy，Bitmap 交由 GC 管理
             image.close()
         }
     }
