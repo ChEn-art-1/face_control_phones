@@ -44,6 +44,40 @@ class FaceControlForegroundService : LifecycleService() {
         private const val CHANNEL_ID = "face_control_channel"
         private const val NOTIFICATION_ID = 1
         private const val ERROR_NOTIFICATION_ID = 2
+
+        // ============================================================
+        // 手势坐标常量（竖屏模式）
+        // ============================================================
+
+        // 滑动坐标
+        private const val SWIPE_START_X_CENTER = 0.5f
+        private const val SWIPE_END_X_CENTER = 0.5f
+        private const val SWIPE_START_Y_BOTTOM = 0.75f
+        private const val SWIPE_END_Y_TOP = 0.25f
+
+        // 左右滑动坐标
+        private const val SWIPE_X_RIGHT = 0.9f
+        private const val SWIPE_X_LEFT = 0.1f
+        private const val SWIPE_Y_CENTER = 0.5f
+
+        // 点击/按压坐标
+        private const val CLICK_X_CENTER = 0.5f
+        private const val CLICK_Y_CENTER = 0.5f
+
+        // ============================================================
+        // 手势坐标常量（横屏模式）
+        // ============================================================
+
+        // 快进/倒退滑动坐标
+        private const val SWIPE_FAST_FORWARD_START_X = 0.2f
+        private const val SWIPE_FAST_FORWARD_END_X = 0.8f
+        private const val SWIPE_REWIND_START_X = 0.8f
+        private const val SWIPE_REWIND_END_X = 0.2f
+        private const val SWIPE_Y_VIDEO = 0.5f
+
+        // 横屏点击/按压坐标
+        private const val CLICK_X_VIDEO_CENTER = 0.5f
+        private const val CLICK_Y_VIDEO_CENTER = 0.5f
     }
 
     /** 相机分析运行在独立线程，不阻塞主线程 */
@@ -290,35 +324,35 @@ class FaceControlForegroundService : LifecycleService() {
             // 双眨眼 → 向上滑动（刷下一条视频/翻下一页）
             FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
                 service.performSwipeAction(
-                    px(0.5f), py(0.75f),
-                    px(0.5f), py(0.25f)
+                    px(SWIPE_START_X_CENTER), py(SWIPE_START_Y_BOTTOM),
+                    px(SWIPE_END_X_CENTER), py(SWIPE_END_Y_TOP)
                 )
             }
             // 左扭头 → 向左滑动（往回翻/退出）
             FaceAnalyzer.FaceAction.SHAKE_LEFT -> {
                 service.performSwipeAction(
-                    px(0.9f), py(0.5f),
-                    px(0.1f), py(0.5f)
+                    px(SWIPE_X_RIGHT), py(SWIPE_Y_CENTER),
+                    px(SWIPE_X_LEFT), py(SWIPE_Y_CENTER)
                 )
             }
             // 右扭头 → 向右滑动（前进/下一项）
             FaceAnalyzer.FaceAction.SHAKE_RIGHT -> {
                 service.performSwipeAction(
-                    px(0.1f), py(0.5f),
-                    px(0.9f), py(0.5f)
+                    px(SWIPE_X_LEFT), py(SWIPE_Y_CENTER),
+                    px(SWIPE_X_RIGHT), py(SWIPE_Y_CENTER)
                 )
             }
             // 张嘴 → 持续按压屏幕中心（触发长按菜单/加速）
             FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                service.startContinuousPress(px(0.5f), py(0.5f))
+                service.startContinuousPress(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
             }
             // 闭嘴 → 停止按压
             FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(px(0.5f), py(0.5f))
+                service.stopContinuousPress(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
             }
             // 点头 → 单次点击（选中/确认/暂停播放）
             FaceAnalyzer.FaceAction.NOD -> {
-                service.performClickAction(px(0.5f), py(0.5f))
+                service.performClickAction(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
             }
             else -> {}  // 单次眨眼在竖屏下无映射
         }
@@ -337,24 +371,24 @@ class FaceControlForegroundService : LifecycleService() {
             // 双眨眼 → 从左向右拖动（快进）
             FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
                 service.performSwipeAction(
-                    px(0.2f), py(0.5f),
-                    px(0.8f), py(0.5f)
+                    px(SWIPE_FAST_FORWARD_START_X), py(SWIPE_Y_VIDEO),
+                    px(SWIPE_FAST_FORWARD_END_X), py(SWIPE_Y_VIDEO)
                 )
             }
             // 点头 → 从右向左拖动（倒退）
             FaceAnalyzer.FaceAction.NOD -> {
                 service.performSwipeAction(
-                    px(0.8f), py(0.5f),
-                    px(0.2f), py(0.5f)
+                    px(SWIPE_REWIND_START_X), py(SWIPE_Y_VIDEO),
+                    px(SWIPE_REWIND_END_X), py(SWIPE_Y_VIDEO)
                 )
             }
             // 张嘴 → 持续长按屏幕中心（触发播放器菜单/倍速）
             FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                service.startContinuousPress(px(0.5f), py(0.5f))
+                service.startContinuousPress(px(CLICK_X_VIDEO_CENTER), py(CLICK_Y_VIDEO_CENTER))
             }
             // 闭嘴 → 停止按压
             FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(px(0.5f), py(0.5f))
+                service.stopContinuousPress(px(CLICK_X_VIDEO_CENTER), py(CLICK_Y_VIDEO_CENTER))
             }
             // 横屏下左右扭头暂不映射，避免与快进倒退混淆
             else -> {}
