@@ -1,4 +1,4 @@
-package com.example.camera.ui.theme
+package org.npu.face_control.ui.theme
 
 import androidx.compose.ui.graphics.Color
 

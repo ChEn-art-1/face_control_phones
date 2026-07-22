@@ -28,13 +28,27 @@ This project aims to provide a new way of interaction for people with disabiliti
 
 ---
 
-## 📸 Gesture Mapping (MVP Stage)
+## 📸 Gesture Mapping
 
-| Gesture | Logic | Simulated Action | Use Case |
-| :--- | :--- | :--- | :--- |
-| **Double Blink** | Two valid blinks within 800ms | **Swipe Up** | Scrolling TikTok / Web pages |
-| **Head Shake** | Nose horizontal displacement | **Swipe Left** | Page turning / Dismissing notifications |
-| **Head Nod** | Pitch angle detection (Reserved) | **Screen Click** | Confirm / Like |
+### Portrait Mode (Scrolling / Browsing)
+
+| Facial Gesture | Simulated Action | Use Case |
+| :--- | :--- | :--- |
+| **Double Blink** | Swipe Up (bottom to top) | Scrolling TikTok / Next page |
+| **Head Shake Left** | Swipe Left (right to left) | Back / Exit / Previous item |
+| **Head Shake Right** | Swipe Right (left to right) | Forward / Next item |
+| **Mouth Open** | Long press at screen center | Trigger long-press menu / Speed up |
+| **Mouth Close** | Release long press | Release long-press action |
+| **Head Nod** | Single click at screen center | Confirm / Select / Pause |
+
+### Landscape Mode (Video Playback / Fullscreen)
+
+| Facial Gesture | Simulated Action | Use Case |
+| :--- | :--- | :--- |
+| **Double Blink** | Swipe Right (fast forward) | Video fast forward |
+| **Head Nod** | Swipe Left (rewind) | Video rewind |
+| **Mouth Open** | Long press at screen center | Trigger player menu / Speed control |
+| **Mouth Close** | Release long press | Release long-press action |
 
 ---
 
@@ -48,58 +62,3 @@ This project aims to provide a new way of interaction for people with disabiliti
 
 ```bash
 git clone https://github.com/your-id/FaceControl-Android.git
-```
-
-### 2. Model File (Crucial)
-Due to size limits, the MediaPipe model file is not included in the repository. Please follow these steps:
-1. Download [face_landmarker.task](https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task).
-2. Place the file into the `app/src/main/assets/` folder of your project.
-
-### 3. Permissions
-After running the app, please enable:
-- **Camera Permission** (For face recognition)
-- **Overlay Permission** (For foreground service operation)
-- **Accessibility Service** (Find `FaceControl Service` in System Settings and turn it on)
-
----
-
-## 🏗️ Project Structure
-
-```
-com.example.camera
-├── FaceAnalyzer.kt              # Vision Core (EAR calculation, gesture detection)
-├── FaceAccessibilityService.kt  # Execution Engine (Gesture simulation)
-├── FaceControlForegroundService.kt # Background Orchestrator
-├── MainActivity.kt              # User Guidance & Permission UI
-└── ui/theme/                    # Compose UI Styles
-```
-
----
-
-## 📅 Roadmap
-
-- [x] Blink detection based on EAR algorithm
-- [x] Support for "Double Blink" to avoid accidental triggers
-- [x] Head shake detection logic
-- [ ] Add Mouth Open trigger
-- [ ] User-customizable [Gesture -> Command] mapping
-- [ ] Sensitivity adjustment and haptic feedback
-
----
-
-## ⚠️ Privacy Policy
-
-Privacy is our priority:
-- All vision analysis is performed **locally on-device**. No images or videos are uploaded to any server.
-- Camera access is used solely for gesture recognition and is not recorded or stored.
-- Accessibility Service is used only to simulate predefined gesture commands.
-
----
-
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE).
-
----
-
-**If you like this project, please give it a Star ⭐️! Contributions via Issues or PRs are welcome.**
