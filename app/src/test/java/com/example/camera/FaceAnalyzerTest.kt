@@ -1,4 +1,4 @@
-package com.example.camera
+package org.npu.face_control
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
