@@ -1,4 +1,4 @@
-package com.example.camera.ui.theme
+package org.npu.face_control.ui.theme
 
 import android.app.Activity
 import android.os.Build

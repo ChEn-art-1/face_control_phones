@@ -1,4 +1,4 @@
-package com.example.camera
+package org.npu.face_control
 
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4

@@ -1,4 +1,4 @@
-package com.example.camera.ui.theme
+package org.npu.face_control.ui.theme
 
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle

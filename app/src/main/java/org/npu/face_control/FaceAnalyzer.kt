@@ -1,4 +1,4 @@
-package com.example.camera
+package org.npu.face_control
 
 import android.content.Context
 import android.graphics.Bitmap

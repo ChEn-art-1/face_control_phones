@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.camera"
+    namespace = "org.npu.face_control"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.camera"
+        applicationId = "org.npu.face_control"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

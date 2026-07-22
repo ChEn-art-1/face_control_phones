@@ -1,4 +1,4 @@
-package com.example.camera
+package org.npu.face_control
 
 import android.app.Notification
 import android.app.NotificationChannel
