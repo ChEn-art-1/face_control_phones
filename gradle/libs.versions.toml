@@ -8,7 +8,7 @@ lifecycle = "2.6.1"
 activityCompose = "1.8.0"
 kotlin = "2.0.21"
 composeBom = "2024.09.00"
-mediapipe = "0.10.14"
+mediapipe = "0.10.26"
 camerax = "1.4.0"
 
 [libraries]
