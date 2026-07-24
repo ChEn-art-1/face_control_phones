@@ -10,12 +10,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.res.stringResource
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import com.example.camera.ui.theme.CameraTheme
+import org.npu.face_control.ui.theme.CameraTheme
 
 class MainActivity : ComponentActivity() {
 
@@ -23,9 +24,9 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission()
     ) { isGranted: Boolean ->
         if (isGranted) {
-            Toast.makeText(this, "Camera permission granted", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(R.string.permission_camera_granted), Toast.LENGTH_SHORT).show()
         } else {
-            Toast.makeText(this, "Camera permission denied", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(R.string.permission_camera_denied), Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -81,21 +82,24 @@ fun MainScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text(text = "FaceControl MVP", style = MaterialTheme.typography.headlineMedium)
+        Text(
+            text = stringResource(R.string.app_title),
+            style = MaterialTheme.typography.headlineMedium
+        )
         Spacer(modifier = Modifier.height(32.dp))
         
         Button(onClick = onRequestCamera, modifier = Modifier.fillMaxWidth()) {
-            Text("1. Request Camera Permission")
+            Text(stringResource(R.string.btn_request_camera))
         }
         Spacer(modifier = Modifier.height(8.dp))
         
         Button(onClick = onOpenAccessibility, modifier = Modifier.fillMaxWidth()) {
-            Text("2. Enable Accessibility Service")
+            Text(stringResource(R.string.btn_enable_accessibility))
         }
         Spacer(modifier = Modifier.height(8.dp))
         
         Button(onClick = onOpenOverlay, modifier = Modifier.fillMaxWidth()) {
-            Text("3. Enable Overlay Permission")
+            Text(stringResource(R.string.btn_enable_overlay))
         }
         Spacer(modifier = Modifier.height(24.dp))
         
@@ -104,7 +108,7 @@ fun MainScreen(
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
         ) {
-            Text("START FACECONTROL")
+            Text(stringResource(R.string.btn_start_service))
         }
     }
 }
