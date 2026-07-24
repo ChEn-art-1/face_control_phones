@@ -31,23 +31,27 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContent {
-            CameraTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    MainScreen(
-                        onStartService = { startFaceControlService() },
-                        onOpenAccessibility = { openAccessibilitySettings() },
-                        onOpenOverlay = { openOverlaySettings() },
-                        onRequestCamera = { requestPermissionLauncher.launch(Manifest.permission.CAMERA) }
-                    )
-                }
+    super.onCreate(savedInstanceState)
+    setContent {
+        CameraTheme {
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = MaterialTheme.colorScheme.background
+            ) {
+                MainScreen(
+                    onStartService = { startFaceControlService() },
+                    onOpenAccessibility = { openAccessibilitySettings() },
+                    onOpenOverlay = { openOverlaySettings() },
+                    onRequestCamera = { requestPermissionLauncher.launch(Manifest.permission.CAMERA) },
+                    onOpenSettings = { 
+                        // 跳转到设置页面
+                        startActivity(Intent(this, SettingsActivity::class.java))
+                    }
+                )
             }
         }
     }
+}
 
     private fun startFaceControlService() {
         val intent = Intent(this, FaceControlForegroundService::class.java)
@@ -73,7 +77,8 @@ fun MainScreen(
     onStartService: () -> Unit,
     onOpenAccessibility: () -> Unit,
     onOpenOverlay: () -> Unit,
-    onRequestCamera: () -> Unit
+    onRequestCamera: () -> Unit,
+    onOpenSettings: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -110,5 +115,15 @@ fun MainScreen(
         ) {
             Text(stringResource(R.string.btn_start_service))
         }
+        Spacer(modifier = Modifier.height(16.dp))  // 加一点间距
+
+        Button(
+            onClick = onOpenSettings,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+        ) {
+            Text(stringResource(R.string.btn_settings))
+        }
+
     }
 }
