@@ -312,7 +312,12 @@ class FaceControlForegroundService : LifecycleService() {
     // ================================================================
 
     private fun handleFaceAction(action: FaceAnalyzer.FaceAction) {
-        val service = FaceAccessibilityService.instance ?: return
+        val service = FaceAccessibilityService.instance
+        if (service == null) {
+            Log.w(TAG, "FaceAccessibilityService 未启动，无法执行手势")
+            return
+        }
+        Log.d(TAG, "收到动作: $action")
         val isPortrait =
             resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
 
@@ -345,8 +350,9 @@ class FaceControlForegroundService : LifecycleService() {
                     px(SWIPE_END_X_CENTER), py(SWIPE_END_Y_TOP)
                 )
             }
-            // 长闭眼（约1.5秒）→ 点击屏幕
+            // 长闭眼 → 点击屏幕（现在触发时 no longer 1.5s wait）
             FaceAnalyzer.FaceAction.LONG_BLINK -> {
+                Log.i(TAG, "LONG_BLINK → 点击屏幕")
                 service.performClickAction(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
             }
             FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
