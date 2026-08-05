@@ -6,9 +6,11 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
-import android.util.DisplayMetrics
+import android.os.Looper
 import android.util.Log
 import android.view.WindowManager
 import android.widget.Toast
@@ -21,147 +23,90 @@ import androidx.lifecycle.LifecycleService
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
-/**
- * ============================================================
- * 前台服务 + 调度中枢 — 本 App 的"大脑"
- *
- * 职责链：
- *   CameraX (前置摄像头)
- *       ↓ 逐帧
- *   FaceAnalyzer (MediaPipe 人脸检测)
- *       ↓ 识别出 FaceAction
- *   当前方法 (判断横/竖屏，映射为具体手势)
- *       ↓ 调用
- *   FaceAccessibilityService (无障碍手势执行)
- *       ↓
- *   系统触摸事件 → 被控制 App 响应
- * ============================================================
- */
 class FaceControlForegroundService : LifecycleService() {
 
     companion object {
         private const val TAG = "FaceControlService"
         private const val CHANNEL_ID = "face_control_channel"
         private const val NOTIFICATION_ID = 1
-        private const val ERROR_NOTIFICATION_ID = 2
-
-        // ============================================================
-        // 手势坐标常量（竖屏模式）
-        // ============================================================
-
-        // 滑动坐标
-        private const val SWIPE_START_X_CENTER = 0.5f
-        private const val SWIPE_END_X_CENTER = 0.5f
-        private const val SWIPE_START_Y_BOTTOM = 0.75f
-        private const val SWIPE_END_Y_TOP = 0.25f
-
-        // 左右滑动坐标
-        private const val SWIPE_X_RIGHT = 0.9f
-        private const val SWIPE_X_LEFT = 0.1f
-        private const val SWIPE_Y_CENTER = 0.5f
-
-        // 点击/按压坐标
-        private const val CLICK_X_CENTER = 0.5f
-        private const val CLICK_Y_CENTER = 0.5f
-
-        // ============================================================
-        // 手势坐标常量（横屏模式）
-        // ============================================================
-
-        // 快进/倒退滑动坐标
-        private const val SWIPE_FAST_FORWARD_START_X = 0.2f
-        private const val SWIPE_FAST_FORWARD_END_X = 0.8f
-        private const val SWIPE_REWIND_START_X = 0.8f
-        private const val SWIPE_REWIND_END_X = 0.2f
-        private const val SWIPE_Y_VIDEO = 0.5f
-
-        // 横屏点击/按压坐标
-        private const val CLICK_X_VIDEO_CENTER = 0.5f
-        private const val CLICK_Y_VIDEO_CENTER = 0.5f
     }
 
-    /** 相机分析运行在独立线程，不阻塞主线程 */
     private lateinit var cameraExecutor: ExecutorService
-
-    /** CameraX 相机提供者，用于资源释放 */
     private var cameraProvider: ProcessCameraProvider? = null
-
-    /** 人脸分析器实例，用于释放资源 */
     private var faceAnalyzer: FaceAnalyzer? = null
 
-    /** 屏幕尺寸，用于百分比坐标换算（动态更新） */
+    // ========== 光标相关 ==========
+    private lateinit var windowManager: WindowManager
+    private var cursorView: CursorView? = null
+    private var cursorLayoutParams: WindowManager.LayoutParams? = null
+    private var isCursorVisible = false
     private var screenWidth = 1080
     private var screenHeight = 2400
 
-    // ================================================================
-    // 生命周期
-    // ================================================================
+    // ========== 光标移动参数 ==========
+    private var currentX = 0f
+    private var currentY = 0f
+    private val CURSOR_SPEED = 35f
+    private val CURSOR_SIZE = 80
+    private val DEAD_ZONE = 0.02f
+
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onCreate() {
         super.onCreate()
+        Log.d(TAG, "🚀 Service onCreate")
         cameraExecutor = Executors.newSingleThreadExecutor()
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         updateScreenSize()
 
-        // 1. 创建前台服务通知（系统必须，否则 Android 8+ 会崩溃）
+        currentX = screenWidth / 2f
+        currentY = screenHeight / 2f
+
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification())
-
-        // 2. 启动 CameraX + 人脸检测流水线
         startCamera()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        Log.d(TAG, "🛑 Service onDestroy")
+        hideCursor()
         releaseResources()
     }
 
     override fun onBind(intent: Intent): IBinder? {
         super.onBind(intent)
-        return null  // 非绑定服务
+        return null
     }
 
-    /**
-     * 屏幕方向变化时重新获取尺寸，保证坐标计算准确
-     */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         updateScreenSize()
     }
 
-    // ================================================================
-    // 屏幕尺寸工具
-    // ================================================================
-
-    /**
-     * 动态获取屏幕真实尺寸，兼容不同 API 版本
-     */
     private fun updateScreenSize() {
-        val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val bounds = windowManager.currentWindowMetrics.bounds
             screenWidth = bounds.width()
             screenHeight = bounds.height()
         } else {
-            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            val metrics = android.util.DisplayMetrics()
             @Suppress("DEPRECATION")
             windowManager.defaultDisplay.getRealMetrics(metrics)
             screenWidth = metrics.widthPixels
             screenHeight = metrics.heightPixels
         }
-        Log.d(TAG, "屏幕尺寸更新: ${screenWidth}x${screenHeight}")
+        Log.d(TAG, "📱 屏幕尺寸: ${screenWidth}x${screenHeight}")
     }
 
-    /** 百分比 X 坐标 → 像素值 */
-    private fun px(percentX: Float): Float = screenWidth * percentX
+    private fun showToast(message: String) {
+        mainHandler.post {
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        }
+    }
 
-    /** 百分比 Y 坐标 → 像素值 */
-    private fun py(percentY: Float): Float = screenHeight * percentY
-
-    // ================================================================
-    // 前台服务通知
-    // ================================================================
-
-    /** 创建通知渠道（Android 8+ 必须） */
+    // ========== 通知 ==========
     private fun createNotificationChannel() {
         val channelName = getString(R.string.notification_channel_name)
         val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
@@ -169,7 +114,6 @@ class FaceControlForegroundService : LifecycleService() {
         manager.createNotificationChannel(channel)
     }
 
-    /** 构建通知内容 */
     private fun createNotification(): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
@@ -178,52 +122,29 @@ class FaceControlForegroundService : LifecycleService() {
             .build()
     }
 
-    /**
-     * 显示错误通知（摄像头启动失败时）
-     */
-    private fun showErrorNotification() {
-        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.error_notification_title))
-            .setContentText(getString(R.string.error_notification_text))
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setAutoCancel(true)
-            .build()
-        manager.notify(ERROR_NOTIFICATION_ID, notification)
-    }
-
-    // ================================================================
-    // CameraX 相机流水线
-    // ================================================================
-
-    /**
-     * 启动前置摄像头 + 人脸分析
-     *
-     * 流程：
-     *   1. 获取 ProcessCameraProvider（CameraX 的生命周期感知相机管理器）
-     *   2. 创建 ImageAnalysis 分析器（只保留最新帧，RGBA 格式）
-     *   3. 创建 FaceAnalyzer 并设置回调（拿到 FaceAction 就执行手势）
-     *   4. 绑定前置摄像头到当前 Lifecycle
-     */
+    // ========== 相机 ==========
     private fun startCamera() {
+        Log.d(TAG, "📷 startCamera 开始")
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             try {
                 cameraProvider = cameraProviderFuture.get()
+                Log.d(TAG, "📷 CameraProvider 获取成功")
 
-                // ----- 图像分析器配置 -----
                 val imageAnalysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    // 只处理最新帧，处理不过来就丢弃旧的（保证实时性）
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                     .build()
 
-                // ----- 人脸分析器（核心算法模块） -----
-                // 传入初始化失败回调：如果模型加载失败，停止服务并通知用户
                 val analyzer = FaceAnalyzer(
                     context = this,
                     onActionDetected = { action ->
-                        handleFaceAction(action)  // 检测到动作 → 执行手势
+                        Log.d(TAG, "📢 收到动作: $action")
+                        handleFaceAction(action)
+                    },
+                    onPoseUpdate = { yaw, pitch ->
+                        Log.d(TAG, "📍 姿态更新: yaw=$yaw, pitch=$pitch")
+                        handlePoseUpdate(yaw, pitch)
                     },
                     onInitFailed = { error ->
                         Log.e(TAG, "人脸识别模型初始化失败", error)
@@ -231,14 +152,13 @@ class FaceControlForegroundService : LifecycleService() {
                     }
                 )
                 faceAnalyzer = analyzer
-
                 imageAnalysis.setAnalyzer(cameraExecutor, analyzer)
 
-                // ----- 选择前置摄像头 -----
                 val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-
-                cameraProvider?.unbindAll()  // 先解绑所有用例
+                cameraProvider?.unbindAll()
                 cameraProvider?.bindToLifecycle(this, cameraSelector, imageAnalysis)
+
+                Log.d(TAG, "📷 相机已启动")
 
             } catch (e: Exception) {
                 Log.e(TAG, "摄像头启动失败", e)
@@ -247,27 +167,11 @@ class FaceControlForegroundService : LifecycleService() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /**
-     * 摄像头打开失败时的处理：通知用户 + 停止服务
-     */
     private fun handleCameraFailure() {
-        Toast.makeText(
-            this,
-            "无法启动摄像头，FaceControl 服务已停止",
-            Toast.LENGTH_LONG
-        ).show()
-
-        showErrorNotification()
+        showToast("无法启动摄像头，FaceControl 服务已停止")
         stopSelf()
     }
 
-    // ================================================================
-    // 资源释放
-    // ================================================================
-
-    /**
-     * 统一释放摄像头及线程资源
-     */
     private fun releaseResources() {
         try {
             cameraProvider?.unbindAll()
@@ -277,7 +181,6 @@ class FaceControlForegroundService : LifecycleService() {
             cameraProvider = null
         }
 
-        // 释放 FaceAnalyzer 资源
         try {
             faceAnalyzer?.close()
         } catch (e: Exception) {
@@ -292,106 +195,209 @@ class FaceControlForegroundService : LifecycleService() {
     }
 
     // ================================================================
-    // 动作→手势 映射调度
+    // 光标控制
     // ================================================================
 
-    /**
-     * 收到 FaceAnalyzer 的人脸动作事件
-     * 先获取无障碍服务实例，再根据横/竖屏选择映射方案
-     */
+    private fun showCursor() {
+        Log.d(TAG, "🖱️ showCursor 被调用, isCursorVisible=$isCursorVisible")
+        if (isCursorVisible) {
+            Log.d(TAG, "⚠️ 光标已显示，跳过")
+            return
+        }
+
+        mainHandler.post {
+            try {
+                if (isCursorVisible) return@post
+
+                val cursor = CursorView(this@FaceControlForegroundService)
+                cursorView = cursor
+
+                val params = WindowManager.LayoutParams(
+                    CURSOR_SIZE,
+                    CURSOR_SIZE,
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                    } else {
+                        @Suppress("DEPRECATION")
+                        WindowManager.LayoutParams.TYPE_PHONE
+                    },
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                            WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+                    PixelFormat.TRANSLUCENT
+                ).apply {
+                    gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                    x = currentX.toInt() - CURSOR_SIZE / 2
+                    y = currentY.toInt() - CURSOR_SIZE / 2
+                }
+
+                cursorLayoutParams = params
+                windowManager.addView(cursor, params)
+                isCursorVisible = true
+                Log.d(TAG, "✅ 光标已显示 at (${currentX.toInt()}, ${currentY.toInt()})")
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ 显示光标失败", e)
+            }
+        }
+    }
+
+    private fun hideCursor() {
+        Log.d(TAG, "🖱️ hideCursor 被调用, isCursorVisible=$isCursorVisible")
+        if (!isCursorVisible) {
+            Log.d(TAG, "⚠️ 光标已隐藏，跳过")
+            return
+        }
+
+        mainHandler.post {
+            try {
+                cursorView?.let { windowManager.removeView(it) }
+            } catch (e: Exception) {
+                Log.e(TAG, "移除光标时出错", e)
+            }
+            cursorView = null
+            cursorLayoutParams = null
+            isCursorVisible = false
+            Log.d(TAG, "✅ 光标已隐藏")
+        }
+    }
+
+    private fun moveCursor(deltaX: Float, deltaY: Float) {
+        if (!isCursorVisible) return
+
+        val moveX = deltaX * CURSOR_SPEED
+        val moveY = deltaY * CURSOR_SPEED
+
+        currentX = (currentX + moveX).coerceIn(0f, screenWidth.toFloat())
+        currentY = (currentY + moveY).coerceIn(0f, screenHeight.toFloat())
+
+        cursorLayoutParams?.let { params ->
+            params.x = currentX.toInt() - CURSOR_SIZE / 2
+            params.y = currentY.toInt() - CURSOR_SIZE / 2
+            try {
+                mainHandler.post {
+                    cursorView?.let { windowManager.updateViewLayout(it, params) }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "更新光标位置时出错", e)
+            }
+        }
+    }
+
+    // ================================================================
+    // 姿态更新处理
+    // ================================================================
+
+    private fun handlePoseUpdate(yaw: Float, pitch: Float) {
+        if (!isCursorVisible) return
+
+        if (kotlin.math.abs(yaw) > DEAD_ZONE || kotlin.math.abs(pitch) > DEAD_ZONE) {
+            moveCursor(-yaw, pitch)
+        }
+    }
+
+    // ================================================================
+    // 动作处理
+    // ================================================================
+
     private fun handleFaceAction(action: FaceAnalyzer.FaceAction) {
-        val service = FaceAccessibilityService.instance ?: return  // 无障碍服务未运行，跳过
-        val isPortrait =
-            resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+        Log.d(TAG, "🎯 处理动作: $action")
+        val service = FaceAccessibilityService.instance
 
-        if (isPortrait) {
-            handlePortraitMode(action, service)
-        } else {
-            handleLandscapeMode(action, service)
-        }
-    }
-
-    // ================================================================
-    // 方案一：竖屏手势映射
-    // 适用场景：刷短视频（抖音/TikTok）、翻页浏览
-    // 所有坐标通过 displayMetrics 动态计算，自适应不同分辨率
-    // ================================================================
-    private fun handlePortraitMode(
-        action: FaceAnalyzer.FaceAction,
-        service: FaceAccessibilityService
-    ) {
         when (action) {
-            // 双眨眼 → 向上滑动（刷下一条视频/翻下一页）
-            FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
-                service.performSwipeAction(
-                    px(SWIPE_START_X_CENTER), py(SWIPE_START_Y_BOTTOM),
-                    px(SWIPE_END_X_CENTER), py(SWIPE_END_Y_TOP)
-                )
+            FaceAnalyzer.FaceAction.ENTER_CONTROL -> {
+                Log.d(TAG, "🎯 进入控制模式")
+                faceAnalyzer?.resetHeadPoseTracker()
+                showCursor()
+                showToast("🎯 进入虚拟光标模式")
             }
-            // 左扭头 → 向左滑动（往回翻/退出）
+            FaceAnalyzer.FaceAction.EXIT_CONTROL -> {
+                Log.d(TAG, "🎯 退出控制模式")
+                hideCursor()
+                faceAnalyzer?.resetHeadPoseTracker()
+                showToast("🛑 退出虚拟光标模式")
+            }
+
+            // ---- 短按点击 ----
+            FaceAnalyzer.FaceAction.CLICK -> {
+                Log.d(TAG, "👆 点击 at (${currentX.toInt()}, ${currentY.toInt()})")
+                service?.performClickAction(currentX, currentY)
+            }
+            // ---- 长按按压 ----
+            FaceAnalyzer.FaceAction.PRESS -> {
+                Log.d(TAG, "👇 长按开始 at (${currentX.toInt()}, ${currentY.toInt()})")
+                service?.startContinuousPress(currentX, currentY)
+            }
+            // ---- 释放长按 ----
+            FaceAnalyzer.FaceAction.RELEASE -> {
+                Log.d(TAG, "👆 释放长按")
+                service?.stopContinuousPress(currentX, currentY)
+            }
+
+            // ---- 原有功能（仅在空闲模式下生效） ----
+            FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
+                Log.d(TAG, "😉😉 双眨眼")
+                if (!isCursorVisible) {
+                    service?.let { performSwipeUp(it) }
+                }
+            }
             FaceAnalyzer.FaceAction.SHAKE_LEFT -> {
-                service.performSwipeAction(
-                    px(SWIPE_X_RIGHT), py(SWIPE_Y_CENTER),
-                    px(SWIPE_X_LEFT), py(SWIPE_Y_CENTER)
-                )
+                Log.d(TAG, "👈 左摇头")
+                if (!isCursorVisible) {
+                    service?.let { performSwipeLeft(it) }
+                }
             }
-            // 右扭头 → 向右滑动（前进/下一项）
             FaceAnalyzer.FaceAction.SHAKE_RIGHT -> {
-                service.performSwipeAction(
-                    px(SWIPE_X_LEFT), py(SWIPE_Y_CENTER),
-                    px(SWIPE_X_RIGHT), py(SWIPE_Y_CENTER)
-                )
+                Log.d(TAG, "👉 右摇头")
+                if (!isCursorVisible) {
+                    service?.let { performSwipeRight(it) }
+                }
             }
-            // 张嘴 → 持续按压屏幕中心（触发长按菜单/加速）
-            FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                service.startContinuousPress(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
-            }
-            // 闭嘴 → 停止按压
-            FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
-            }
-            // 点头 → 单次点击（选中/确认/暂停播放）
             FaceAnalyzer.FaceAction.NOD -> {
-                service.performClickAction(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
+                Log.d(TAG, "👆 点头")
+                if (!isCursorVisible) {
+                    service?.let { performClick(it) }
+                }
             }
-            else -> {}  // 单次眨眼在竖屏下无映射
+            else -> {
+                Log.d(TAG, "忽略动作: $action")
+            }
         }
     }
 
     // ================================================================
-    // 方案二：横屏手势映射
-    // 适用场景：看电影/视频（全屏播放器）
-    // 所有坐标通过 displayMetrics 动态计算，自适应不同分辨率
+    // 原有手势方法
     // ================================================================
-    private fun handleLandscapeMode(
-        action: FaceAnalyzer.FaceAction,
-        service: FaceAccessibilityService
-    ) {
-        when (action) {
-            // 双眨眼 → 从左向右拖动（快进）
-            FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
-                service.performSwipeAction(
-                    px(SWIPE_FAST_FORWARD_START_X), py(SWIPE_Y_VIDEO),
-                    px(SWIPE_FAST_FORWARD_END_X), py(SWIPE_Y_VIDEO)
-                )
-            }
-            // 点头 → 从右向左拖动（倒退）
-            FaceAnalyzer.FaceAction.NOD -> {
-                service.performSwipeAction(
-                    px(SWIPE_REWIND_START_X), py(SWIPE_Y_VIDEO),
-                    px(SWIPE_REWIND_END_X), py(SWIPE_Y_VIDEO)
-                )
-            }
-            // 张嘴 → 持续长按屏幕中心（触发播放器菜单/倍速）
-            FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                service.startContinuousPress(px(CLICK_X_VIDEO_CENTER), py(CLICK_Y_VIDEO_CENTER))
-            }
-            // 闭嘴 → 停止按压
-            FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(px(CLICK_X_VIDEO_CENTER), py(CLICK_Y_VIDEO_CENTER))
-            }
-            // 横屏下左右扭头暂不映射，避免与快进倒退混淆
-            else -> {}
+
+    private fun performSwipeUp(service: FaceAccessibilityService) {
+        val isPortrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+        if (isPortrait) {
+            service.performSwipeAction(
+                screenWidth * 0.5f, screenHeight * 0.75f,
+                screenWidth * 0.5f, screenHeight * 0.25f
+            )
         }
+    }
+
+    private fun performSwipeLeft(service: FaceAccessibilityService) {
+        val isPortrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+        if (isPortrait) {
+            service.performSwipeAction(
+                screenWidth * 0.8f, screenHeight * 0.5f,
+                screenWidth * 0.2f, screenHeight * 0.5f
+            )
+        }
+    }
+
+    private fun performSwipeRight(service: FaceAccessibilityService) {
+        val isPortrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+        if (isPortrait) {
+            service.performSwipeAction(
+                screenWidth * 0.2f, screenHeight * 0.5f,
+                screenWidth * 0.8f, screenHeight * 0.5f
+            )
+        }
+    }
+
+    private fun performClick(service: FaceAccessibilityService) {
+        service.performClickAction(screenWidth * 0.5f, screenHeight * 0.5f)
     }
 }

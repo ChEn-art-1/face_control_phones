@@ -17,66 +17,61 @@ import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 
-/**
- * ============================================================
- * 人脸动作识别引擎 — 本 App 的核心算法模块
- *
- * 职责：
- *   1. 加载 MediaPipe FaceLandmarker 模型（face_landmarker.task）
- *   2. 接收 CameraX 的每一帧图像
- *   3. 用 468 个面部关键点检测：眨眼、扭头、点头、张嘴
- *   4. 将识别结果通过 onActionDetected 回调通知出去
- *
- * 检测的 7 种动作：
- *   BLINK         → 单次生理性眨眼（可参与双眨眼判定）
- *   DOUBLE_BLINK  → 双眨眼（100~569ms 内两次眨眼）
- *   LONG_BLINK    → 主动长闭眼（350~600ms）
- *   SHAKE_LEFT    → 向左扭头
- *   SHAKE_RIGHT   → 向右扭头
- *   NOD           → 点头（低头）
- *   MOUTH_OPEN    → 张嘴
- *   MOUTH_CLOSE   → 闭嘴
- * ============================================================
- */
 class FaceAnalyzer(
     context: Context,
     private val onActionDetected: (FaceAction) -> Unit,
-    /** 初始化失败回调，交由上层决定后续动作（例如停止 Service 并通知用户） */
+    private val onPoseUpdate: ((Float, Float) -> Unit)? = null,
     private val onInitFailed: ((Throwable) -> Unit)? = null
 ) : ImageAnalysis.Analyzer {
 
     companion object {
         private const val TAG = "FaceAnalyzer"
+        private const val ENTER_CONTROL_DELAY_MS = 5000L
+        private const val EXIT_CONTROL_DELAY_MS = 3000L
+        private const val SHORT_PRESS_MAX_MS = 500L
 
-        // ------- 眨眼时间分类阈值（ms）-------
-        private const val PHYSIO_BLINK_MAX_MS = 180L      // < 180ms 视为生理性眨眼（可参与双眨眼判定）
-        private const val IGNORE_BLINK_MAX_MS = 350L      // 180~350ms 忽略，避免误触
-        private const val LONG_BLINK_MAX_MS = 600L        // 350~600ms 主动长闭眼
-        // > 600ms 视为闭眼休息，忽略
-
-        // ------- 双眨眼时间窗口 -------
+        private const val PHYSIO_BLINK_MAX_MS = 180L
+        private const val IGNORE_BLINK_MAX_MS = 350L
+        private const val LONG_BLINK_MAX_MS = 600L
         private const val DOUBLE_BLINK_MIN_INTERVAL = 100L
         private const val DOUBLE_BLINK_MAX_INTERVAL = 569L
-
-        // ------- 其他动作后眨眼禁用时长 -------
-        private const val BLINK_DISABLE_DURATION_MS = 1000L
-
-        // ------- 摇头动作节流 -------
         private const val SHAKE_LOCK_DURATION_MS = 1000L
-
-        // ------- 人脸丢失超时重置 -------
         private const val FACE_LOST_TIMEOUT_MS = 2000L
     }
 
-    /**
-     * 可运行时调节的阈值集合。通过 [updateThresholds] 修改。
-     */
+    private var faceLandmarker: FaceLandmarker? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val headPoseTracker = HeadPoseTracker()
+
+    // ========== 核心状态 ==========
+    private var isInControlMode = false
+    private var isReleased = false
+
+    // 进入/退出计时
+    private var enterControlStartTime = 0L
+    private var exitControlStartTime = 0L
+
+    // 眨眼状态
+    private var isEyesClosed = false
+    private var eyesClosedStartTime = 0L
+    private var lastPhysioBlinkTimestamp = 0L
+    private var isBlinkControlEnabled = true
+
+    // 张嘴状态
+    private var isMouthOpened = false
+    private var mouthOpenStartTime = 0L
+
+    // 摇头防抖
+    private var isShakeLocked = false
+    private var lastFaceDetectedTime = 0L
+
+    // 阈值配置
     data class Thresholds(
-        var earClose: Float = 0.2f,          // 眼睛闭合的 EAR 阈值
-        var shakeLeftRatio: Float = 0.75f,   // 摇头（向左侧）阈值
-        var shakeRightRatio: Float = 0.25f,  // 摇头（向右侧）阈值
-        var nodRatio: Float = 0.6f,          // 点头阈值
-        var mouthOpenMar: Float = 0.5f       // 张嘴 MAR 阈值
+        var earClose: Float = 0.2f,
+        var shakeLeftRatio: Float = 0.75f,
+        var shakeRightRatio: Float = 0.25f,
+        var nodRatio: Float = 0.6f,
+        var mouthOpenMar: Float = 0.5f
     )
 
     @Volatile
@@ -87,37 +82,8 @@ class FaceAnalyzer(
         thresholds = newThresholds
     }
 
-    // ---------- MediaPipe 人脸关键点检测器 ----------
-    private var faceLandmarker: FaceLandmarker? = null
-
-    // ---------- 线程和状态 ----------
-    private val mainHandler = Handler(Looper.getMainLooper())
-
-    // -------- 眨眼状态 --------
-    private var isEyesClosed = false
-    private var eyesClosedStartTime: Long = 0L
-    private var lastPhysioBlinkTimestamp: Long = 0L
-
-    // 眨眼控制开关：识别到其他动作后临时禁用
-    @Volatile
-    private var isBlinkControlEnabled = true
-
-    // -------- 其他动作状态 --------
-    private var isShakeLocked = false
-    private var isMouthOpened = false
-
-    // -------- 人脸跟踪状态 --------
-    private var lastFaceDetectedTime: Long = 0L
-
-    // 用于禁用眨眼的延迟任务，方便统一清理
-    private val enableBlinkRunnable = Runnable { isBlinkControlEnabled = true }
-    private val unlockShakeRunnable = Runnable { isShakeLocked = false }
-
-    // 标记 Analyzer 是否已释放，防止在关闭后再处理帧
-    @Volatile
-    private var isReleased = false
-
     init {
+        Log.d(TAG, "🔥 FaceAnalyzer 初始化成功！")
         try {
             val baseOptions = BaseOptions.builder()
                 .setModelAssetPath("face_landmarker.task")
@@ -133,14 +99,10 @@ class FaceAnalyzer(
         } catch (e: Throwable) {
             Log.e(TAG, "FaceLandmarker 初始化失败", e)
             faceLandmarker = null
-            // 抛给上层去处理（停止服务 / 通知用户等）
             onInitFailed?.invoke(e)
         }
     }
 
-    // ============================================================
-    // CameraX 分析器接口 — 每来一帧就调用一次
-    // ============================================================
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(image: ImageProxy) {
         val landmarker = faceLandmarker
@@ -150,10 +112,7 @@ class FaceAnalyzer(
         }
 
         try {
-            // ---------- 1. 将相机帧转成 Bitmap ----------
             val originalBitmap = image.toBitmap()
-
-            // ---------- 2. 处理旋转 ----------
             val rotatedBitmap = if (image.imageInfo.rotationDegrees != 0) {
                 val matrix = Matrix().apply {
                     postRotate(image.imageInfo.rotationDegrees.toFloat())
@@ -167,36 +126,24 @@ class FaceAnalyzer(
                 originalBitmap
             }
 
-            // ---------- 3. 转成 MediaPipe 的 MP Image 格式 ----------
             val mpImage = BitmapImageBuilder(rotatedBitmap).build()
-
-            // ---------- 4. 异步检测 ----------
-            // 关键修改：将纳秒转换为毫秒
-            // image.imageInfo.timestamp 返回纳秒，MediaPipe 需要毫秒
             val timestampMs = image.imageInfo.timestamp / 1_000_000
             landmarker.detectAsync(mpImage, timestampMs)
-
-            // 不在此处回收 Bitmap。
-            // 因为 detectAsync 是异步的，MediaPipe 内部会在后台线程处理图像数据。
-            // 手动 recycle() 会导致后台线程访问已回收的内存，造成崩溃。
-            // Android 8.0+ 的 Bitmap 像素数据在 Native 堆，GC 会自动回收。
         } catch (e: Throwable) {
             Log.e(TAG, "analyze frame failed", e)
         } finally {
-            // 只释放 ImageProxy，Bitmap 交由 GC 管理
             image.close()
         }
     }
 
     // ============================================================
-    // MediaPipe 检测结果处理器 — 每帧检测完成后回调
+    // 核心处理逻辑
     // ============================================================
     private fun processResult(result: FaceLandmarkerResult) {
         if (isReleased) return
 
         val landmarksList = result.faceLandmarks()
         if (landmarksList.isNullOrEmpty()) {
-            // 超过 2 秒没检测到人脸 → 重置所有状态，防止回到画面时误触发
             if (System.currentTimeMillis() - lastFaceDetectedTime > FACE_LOST_TIMEOUT_MS) {
                 isEyesClosed = false
                 isMouthOpened = false
@@ -208,17 +155,116 @@ class FaceAnalyzer(
         }
         lastFaceDetectedTime = System.currentTimeMillis()
 
-        // 只处理第一张人脸（单用户场景）
         val landmarks = landmarksList[0]
         val th = thresholds
 
-        // ---------------- 1. 眨眼逻辑 ----------------
+        // ---- 1. 检测睁眼/闭眼 ----
         val leftEar = calculateEAR(landmarks, 362, 385, 387, 263, 373, 380)
         val rightEar = calculateEAR(landmarks, 33, 160, 158, 133, 153, 144)
         val avgEar = (leftEar + rightEar) / 2f
-        handleBlink(avgEar < th.earClose)
+        val eyesClosedNow = avgEar < th.earClose
 
-        // ---------------- 2. 摇头逻辑 ----------------
+        // ---- 2. 检测张嘴/闭嘴 ----
+        val upperLip = landmarks[13]
+        val lowerLip = landmarks[14]
+        val leftMouth = landmarks[78]
+        val rightMouth = landmarks[308]
+        val mouthHeight = dist(upperLip, lowerLip)
+        val mouthWidth = dist(leftMouth, rightMouth)
+        val mar = if (mouthWidth > 0) mouthHeight / mouthWidth else 0f
+        val mouthOpenNow = mar > th.mouthOpenMar
+
+        // ---- 3. 核心状态机 ----
+        handleStateMachine(eyesClosedNow, mouthOpenNow, landmarks)
+
+        // ---- 4. 在空闲模式下执行原有动作 ----
+        if (!isInControlMode) {
+            handleOriginalActions(eyesClosedNow, mouthOpenNow, landmarks)
+        }
+    }
+
+    // ============================================================
+    // 状态机
+    // ============================================================
+    private fun handleStateMachine(eyesClosedNow: Boolean, mouthOpenNow: Boolean, landmarks: List<NormalizedLandmark>) {
+        val now = System.currentTimeMillis()
+
+        if (!isInControlMode) {
+            // ---- 空闲模式：检测进入条件（闭眼≥5秒） ----
+            if (eyesClosedNow) {
+                if (enterControlStartTime == 0L) {
+                    enterControlStartTime = now
+                    Log.d(TAG, "⏱️ 开始计时进入控制模式...")
+                } else if (now - enterControlStartTime >= ENTER_CONTROL_DELAY_MS) {
+                    isInControlMode = true
+                    enterControlStartTime = 0L
+                    headPoseTracker.reset()
+                    onActionDetected(FaceAction.ENTER_CONTROL)
+                    Log.d(TAG, "🚀 进入虚拟光标控制模式")
+                }
+            } else {
+                enterControlStartTime = 0L
+            }
+        } else {
+            // ---- 控制模式 ----
+            // 1. 光标移动（头部姿态）
+            val pose = headPoseTracker.calculatePose(landmarks)
+            val isLookingAway = kotlin.math.abs(pose.yaw) > 0.02f || kotlin.math.abs(pose.pitch) > 0.02f
+            if (isLookingAway) {
+                onPoseUpdate?.invoke(pose.yaw, pose.pitch)
+            } else {
+                onPoseUpdate?.invoke(0f, 0f)
+            }
+
+            // 2. 张嘴/闭嘴 → 短按/长按
+            if (mouthOpenNow && !isMouthOpened) {
+                isMouthOpened = true
+                mouthOpenStartTime = now
+                Log.d(TAG, "👄 张嘴开始")
+            } else if (!mouthOpenNow && isMouthOpened) {
+                isMouthOpened = false
+                val duration = now - mouthOpenStartTime
+                if (duration < SHORT_PRESS_MAX_MS) {
+                    onActionDetected(FaceAction.CLICK)
+                    Log.d(TAG, "👆 短按点击 (${duration}ms)")
+                } else {
+                    onActionDetected(FaceAction.PRESS)
+                    Log.d(TAG, "👇 长按 (${duration}ms)")
+                }
+                mouthOpenStartTime = 0L
+            }
+
+            // 3. 检测退出条件（闭眼≥3秒）
+            if (eyesClosedNow) {
+                if (exitControlStartTime == 0L) {
+                    exitControlStartTime = now
+                    Log.d(TAG, "⏱️ 开始计时退出控制模式...")
+                } else if (now - exitControlStartTime >= EXIT_CONTROL_DELAY_MS) {
+                    isInControlMode = false
+                    exitControlStartTime = 0L
+                    if (isMouthOpened) {
+                        isMouthOpened = false
+                        mouthOpenStartTime = 0L
+                        // 如果退出时还张着嘴，不触发释放
+                    }
+                    headPoseTracker.reset()
+                    onActionDetected(FaceAction.EXIT_CONTROL)
+                    Log.d(TAG, "🛑 退出虚拟光标控制模式")
+                }
+            } else {
+                exitControlStartTime = 0L
+            }
+        }
+    }
+
+    // ============================================================
+    // 原有动作（仅在空闲模式下执行）
+    // ============================================================
+    private fun handleOriginalActions(eyesClosedNow: Boolean, mouthOpenNow: Boolean, landmarks: List<NormalizedLandmark>) {
+        val th = thresholds
+
+        handleBlink(eyesClosedNow)
+
         val nose = landmarks[1]
         val rightFaceEdge = landmarks[234]
         val leftFaceEdge = landmarks[454]
@@ -232,7 +278,6 @@ class FaceAnalyzer(
             }
         }
 
-        // ---------------- 3. 点头逻辑 ----------------
         val noseTip = landmarks[1]
         val forehead = landmarks[10]
         val chin = landmarks[152]
@@ -244,39 +289,20 @@ class FaceAnalyzer(
             }
         }
 
-        // ---------------- 4. 张嘴逻辑（几何 MAR 计算）---------------
-        val upperLip = landmarks[13]
-        val lowerLip = landmarks[14]
-        val leftMouth = landmarks[78]
-        val rightMouth = landmarks[308]
-        val mouthHeight = dist(upperLip, lowerLip)
-        val mouthWidth = dist(leftMouth, rightMouth)
-        if (mouthWidth > 0) {
-            val mar = mouthHeight / mouthWidth
-            if (mar > th.mouthOpenMar) {
-                if (!isMouthOpened) {
-                    isMouthOpened = true
-                    dispatchNonBlinkAction(FaceAction.MOUTH_OPEN)
-                }
-            } else {
-                if (isMouthOpened) {
-                    isMouthOpened = false
-                    dispatchNonBlinkAction(FaceAction.MOUTH_CLOSE)
-                }
-            }
+        if (mouthOpenNow && !isMouthOpened) {
+            isMouthOpened = true
+            onActionDetected(FaceAction.MOUTH_OPEN)
+        } else if (!mouthOpenNow && isMouthOpened) {
+            isMouthOpened = false
+            onActionDetected(FaceAction.MOUTH_CLOSE)
         }
     }
 
     // ============================================================
-    // 眨眼状态机
+    // 眨眼逻辑
     // ============================================================
-
-    /**
-     * 眨眼状态机：
-     * - 记录闭眼开始时间
-     * - 睁眼时按持续时长分类处理
-     */
     private fun handleBlink(eyesClosedNow: Boolean) {
+        if (!isBlinkControlEnabled) return
         val now = System.currentTimeMillis()
 
         if (eyesClosedNow) {
@@ -287,35 +313,18 @@ class FaceAnalyzer(
             return
         }
 
-        // 从闭 → 睁
         if (isEyesClosed) {
             isEyesClosed = false
             val duration = now - eyesClosedStartTime
 
-            // 眨眼控制被禁用时，直接丢弃本次事件
-            if (!isBlinkControlEnabled) {
-                lastPhysioBlinkTimestamp = 0L
-                return
-            }
-
             when {
-                duration < PHYSIO_BLINK_MAX_MS -> {
-                    // 生理性眨眼：不直接触发动作，但参与双眨眼判定
-                    checkDoubleBlink(now)
-                }
-                duration < IGNORE_BLINK_MAX_MS -> {
-                    // 180~350ms 忽略，同时重置双眨眼计时避免误配
-                    lastPhysioBlinkTimestamp = 0L
-                }
+                duration < PHYSIO_BLINK_MAX_MS -> checkDoubleBlink(now)
+                duration < IGNORE_BLINK_MAX_MS -> lastPhysioBlinkTimestamp = 0L
                 duration < LONG_BLINK_MAX_MS -> {
-                    // 350~600ms 主动长闭眼
                     lastPhysioBlinkTimestamp = 0L
                     onActionDetected(FaceAction.LONG_BLINK)
                 }
-                else -> {
-                    // > 600ms 视为休息，忽略
-                    lastPhysioBlinkTimestamp = 0L
-                }
+                else -> lastPhysioBlinkTimestamp = 0L
             }
         }
     }
@@ -329,53 +338,20 @@ class FaceAnalyzer(
             lastPhysioBlinkTimestamp = 0L
         } else {
             lastPhysioBlinkTimestamp = now
-            // 单次生理性眨眼保留 BLINK 事件以便上层可选使用
             onActionDetected(FaceAction.BLINK)
         }
     }
 
-    // ============================================================
-    // 动作触发辅助方法
-    // ============================================================
-
     private fun triggerShake(action: FaceAction) {
         if (isShakeLocked) return
         isShakeLocked = true
-        dispatchNonBlinkAction(action)
-        mainHandler.postDelayed(unlockShakeRunnable, SHAKE_LOCK_DURATION_MS)
-    }
-
-    /**
-     * 非眨眼动作触发：
-     * 1. 通知上层
-     * 2. 临时禁用眨眼识别，避免头动/张嘴瞬间的眼形变化被误判成眨眼
-     */
-    private fun dispatchNonBlinkAction(action: FaceAction) {
         onActionDetected(action)
-        disableBlinkTemporarily()
-    }
-
-    private fun disableBlinkTemporarily() {
-        isBlinkControlEnabled = false
-        // 重置眨眼相关状态
-        isEyesClosed = false
-        lastPhysioBlinkTimestamp = 0L
-        mainHandler.removeCallbacks(enableBlinkRunnable)
-        mainHandler.postDelayed(enableBlinkRunnable, BLINK_DISABLE_DURATION_MS)
+        mainHandler.postDelayed({ isShakeLocked = false }, SHAKE_LOCK_DURATION_MS)
     }
 
     // ============================================================
-    // 几何计算工具方法
+    // 辅助方法
     // ============================================================
-
-    /**
-     * 计算 Eye Aspect Ratio (EAR)
-     * 用于判断眼睛开合状态，值越小表示眼睛闭合程度越高
-     *
-     * 公式：(dist(p2,p6) + dist(p3,p5)) / (2 * dist(p1,p4))
-     *   p1/p4 → 眼睛左右眼角
-     *   p2-p6、p3-p5 → 上下眼睑对应点
-     */
     private fun calculateEAR(
         l: List<NormalizedLandmark>,
         p1: Int, p2: Int, p3: Int, p4: Int, p5: Int, p6: Int
@@ -390,21 +366,9 @@ class FaceAnalyzer(
         )
     }
 
-    /**
-     * 计算两个关键点之间的 2D 欧氏距离
-     * 委托给 FaceMath.dist() 实现，方便单测验证
-     */
     private fun dist(a: NormalizedLandmark, b: NormalizedLandmark): Float =
         FaceMath.dist(a.x(), a.y(), b.x(), b.y())
 
-    // ============================================================
-    // 资源释放
-    // ============================================================
-
-    /**
-     * 释放资源。上层（Service.onDestroy）必须调用，否则 FaceLandmarker
-     * 和 Handler 延迟任务会导致内存泄漏。
-     */
     fun close() {
         isReleased = true
         mainHandler.removeCallbacksAndMessages(null)
@@ -417,18 +381,27 @@ class FaceAnalyzer(
         }
     }
 
+    fun resetHeadPoseTracker() {
+        headPoseTracker.reset()
+        Log.d(TAG, "🔄 HeadPoseTracker 已重置")
+    }
+
     // ============================================================
     // 动作枚举
     // ============================================================
-
     enum class FaceAction {
-        BLINK,          // 单次生理性眨眼（可选使用）
-        DOUBLE_BLINK,   // 双眨眼
-        LONG_BLINK,     // 主动长闭眼（350~600ms）
+        BLINK,
+        DOUBLE_BLINK,
+        LONG_BLINK,
         NOD,
         SHAKE_LEFT,
         SHAKE_RIGHT,
         MOUTH_OPEN,
-        MOUTH_CLOSE
+        MOUTH_CLOSE,
+        ENTER_CONTROL,
+        EXIT_CONTROL,
+        CLICK,      // 短按点击
+        PRESS,      // 长按
+        RELEASE     // 释放长按
     }
 }
