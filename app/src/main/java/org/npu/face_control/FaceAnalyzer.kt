@@ -33,6 +33,7 @@ import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 class FaceAnalyzer(
     context: Context,
     private val onActionDetected: (FaceAction) -> Unit,
+    private val onHeadDirection: ((Float, Float) -> Unit)? = null,
     private val onInitFailed: ((Throwable) -> Unit)? = null
 ) : ImageAnalysis.Analyzer {
 
@@ -40,13 +41,22 @@ class FaceAnalyzer(
         private const val TAG = "FaceAnalyzer"
 
         private const val LONG_BLINK_MIN_MS = 800L
-        private const val DOUBLE_BLINK_MIN_INTERVAL = 100L
-        private const val DOUBLE_BLINK_MAX_INTERVAL = 569L
+        // 短眨眼（生理性）时长上限：低于此值才计为双眨眼候选
+        private const val SHORT_BLINK_MAX_MS = 300L
+        // 双眨眼两段间隔窗口（放宽以提高灵敏度）
+        private const val DOUBLE_BLINK_MIN_INTERVAL = 80L
+        private const val DOUBLE_BLINK_MAX_INTERVAL = 700L
         private const val BLINK_DISABLE_DURATION_MS = 1000L
         private const val SHAKE_LOCK_DURATION_MS = 1000L
         private const val FACE_LOST_TIMEOUT_MS = 2000L
         // 自适应 EAR 基数采集：每 N 帧统计一次平均值
         private const val EAR_BASELINE_INTERVAL = 120
+
+        // 准心模式偏头方向阈值：比基础手势阈值更小（死区更窄），小范围偏头即响应
+        private const val CROSSHAIR_SHAKE_LEFT_RATIO = 0.60f
+        private const val CROSSHAIR_SHAKE_RIGHT_RATIO = 0.40f
+        private const val CROSSHAIR_NOD_RATIO = 0.55f
+        private const val CROSSHAIR_LOOK_UP_RATIO = 0.45f
     }
 
     data class Thresholds(
@@ -71,6 +81,12 @@ class FaceAnalyzer(
     private var frameCount = 0L
 
     @Volatile private var isBlinkControlEnabled = true
+
+    /** 准心模式下置为 false，屏蔽低头/摇头/张嘴等非眨眼动作的派发（双击眨眼仍有效） */
+    @Volatile var nonBlinkActionsEnabled = true
+
+    /** 准心模式下置为 false，屏蔽长闭眼点击（双击眨眼仍有效） */
+    @Volatile var longBlinkEnabled = true
 
     // 自适应 EAR 基线
     private var earBaseline = 0.25f  // 默认睁眼 EAR 典型值，会动态更新
@@ -162,27 +178,53 @@ class FaceAnalyzer(
             Log.d(TAG, "帧${frameCount}: EAR=$avgEar 基线=$earBaseline 闭眼阈值=$earCloseThreshold 闭眼=${avgEar < earCloseThreshold}")
         }
 
-        // --- 摇头 ---
+        // --- 偏头方向（供准心模式光标移动，输出 -1/0/+1 方向向量）---
         val nose = landmarks[1]
         val rightFaceEdge = landmarks[234]
         val leftFaceEdge = landmarks[454]
+        val forehead = landmarks[10]
+        val chin = landmarks[152]
+
+        var headDx = 0f  // +1 右, -1 左
+        var headDy = 0f  // +1 下, -1 上
+
+        // 摇头（横向）：基础手势用 th 阈值（不变），准心方向用更小的阈值
         val faceWidth = leftFaceEdge.x() - rightFaceEdge.x()
         if (faceWidth > 0) {
             val ratio = (nose.x() - rightFaceEdge.x()) / faceWidth
-            if (ratio > th.shakeLeftRatio) triggerShake(FaceAction.SHAKE_LEFT)
-            else if (ratio < th.shakeRightRatio) triggerShake(FaceAction.SHAKE_RIGHT)
+            if (ratio > th.shakeLeftRatio) {
+                triggerShake(FaceAction.SHAKE_LEFT)
+            } else if (ratio < th.shakeRightRatio) {
+                triggerShake(FaceAction.SHAKE_RIGHT)
+            }
+
+            if (ratio > CROSSHAIR_SHAKE_LEFT_RATIO) {
+                headDx = -1f
+            } else if (ratio < CROSSHAIR_SHAKE_RIGHT_RATIO) {
+                headDx = 1f
+            }
         }
 
-        // --- 低头/抬头 ---
-        val forehead = landmarks[10]
-        val chin = landmarks[152]
+        // 低头/抬头（纵向）：基础手势用 th 阈值（不变），准心方向用更小的阈值
         val faceHeight = dist(forehead, chin)
         if (faceHeight > 0) {
             val nodRatio = (nose.y() - forehead.y()) / faceHeight
-            if (nodRatio > th.nodRatio) triggerHeadDown()
-            else if (nodRatio < th.lookUpRatio) triggerLookUp()
-            else { isHeadDownLocked = false; isHeadUpLocked = false }
+            if (nodRatio > th.nodRatio) {
+                triggerHeadDown()
+            } else if (nodRatio < th.lookUpRatio) {
+                triggerLookUp()
+            } else {
+                isHeadDownLocked = false; isHeadUpLocked = false
+            }
+
+            if (nodRatio > CROSSHAIR_NOD_RATIO) {
+                headDy = 1f
+            } else if (nodRatio < CROSSHAIR_LOOK_UP_RATIO) {
+                headDy = -1f
+            }
         }
+
+        onHeadDirection?.invoke(headDx, headDy)
 
         // --- 张嘴 ---
         val upperLip = landmarks[13]; val lowerLip = landmarks[14]
@@ -213,7 +255,7 @@ class FaceAnalyzer(
                 Log.d(TAG, "→ 闭眼开始")
             }
             // 闭眼持续中：检查是否达到长闭眼阈值
-            if (!longBlinkFired && isBlinkControlEnabled) {
+            if (!longBlinkFired && isBlinkControlEnabled && longBlinkEnabled) {
                 val duration = now - eyesClosedStartTime
                 if (duration >= LONG_BLINK_MIN_MS) {
                     longBlinkFired = true
@@ -228,8 +270,11 @@ class FaceAnalyzer(
                 Log.d(TAG, "← 睁眼 (持续${duration}ms)")
                 if (!isBlinkControlEnabled || longBlinkFired) {
                     lastPhysioBlinkTimestamp = 0L
-                } else if (duration < 180L) {
+                } else if (duration < SHORT_BLINK_MAX_MS) {
                     checkDoubleBlink(now)
+                } else {
+                    // 中等时长眨眼（介于短眨眼与长闭眼之间），重置计数避免误判
+                    lastPhysioBlinkTimestamp = 0L
                 }
             }
         }
@@ -267,6 +312,7 @@ class FaceAnalyzer(
     }
 
     private fun dispatchNonBlinkAction(action: FaceAction) {
+        if (!nonBlinkActionsEnabled) return
         onActionDetected(action)
         disableBlinkTemporarily()
     }

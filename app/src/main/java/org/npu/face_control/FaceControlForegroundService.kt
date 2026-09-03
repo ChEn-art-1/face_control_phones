@@ -7,7 +7,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
@@ -66,20 +69,12 @@ class FaceControlForegroundService : LifecycleService() {
         private const val CLICK_X_CENTER = 0.5f
         private const val CLICK_Y_CENTER = 0.5f
 
-        // ============================================================
-        // 手势坐标常量（横屏模式）
-        // ============================================================
+        // 准心光标移动：每帧步长（像素）与屏幕边距（像素，避免光标贴边）
+        private const val CROSSHAIR_STEP_PX = 12f
+        private const val CROSSHAIR_MARGIN = 30f
 
-        // 快进/倒退滑动坐标
-        private const val SWIPE_FAST_FORWARD_START_X = 0.2f
-        private const val SWIPE_FAST_FORWARD_END_X = 0.8f
-        private const val SWIPE_REWIND_START_X = 0.8f
-        private const val SWIPE_REWIND_END_X = 0.2f
-        private const val SWIPE_Y_VIDEO = 0.5f
-
-        // 横屏点击/按压坐标
-        private const val CLICK_X_VIDEO_CENTER = 0.5f
-        private const val CLICK_Y_VIDEO_CENTER = 0.5f
+        // 命中检测（高亮命中目标）的节流间隔（毫秒）
+        private const val HIT_TEST_INTERVAL_MS = 400L
     }
 
     /** 相机分析运行在独立线程，不阻塞主线程 */
@@ -94,6 +89,40 @@ class FaceControlForegroundService : LifecycleService() {
     /** 屏幕尺寸，用于百分比坐标换算（动态更新） */
     private var screenWidth = 1080
     private var screenHeight = 2400
+
+    // ================================================================
+    // 准心模式（用户自选点击/长按位置）
+    // ================================================================
+
+    /** 准心模式是否开启 */
+    @Volatile private var crosshairMode = false
+
+    /** 准心悬浮窗实例（主线程创建/移除，相机线程读取，用 @Volatile 保证可见性） */
+    @Volatile private var crosshairView: CrosshairOverlayView? = null
+
+    /** 用户选定的位置（像素），-1 表示未设置 */
+    @Volatile private var selectedX = -1f
+    @Volatile private var selectedY = -1f
+
+    /** 准心光标当前位置（像素），仅在准心模式下有效 */
+    @Volatile private var cursorX = 0f
+    @Volatile private var cursorY = 0f
+
+    /** 上次命中检测时间（用于节流，避免每帧遍历节点树） */
+    private var lastHitTestTime = 0L
+
+    /** 命中检测是否正在执行（防止上一次未完成时再排队） */
+    @Volatile private var hitTestInProgress = false
+
+    /** 命中检测线程：节点树遍历较重，放后台线程避免阻塞主线程导致光标卡顿 */
+    private val hitTestExecutor = Executors.newSingleThreadExecutor()
+
+    /** 当前长按落点（张嘴时记录，闭嘴时复用同一落点） */
+    private var pressPointX = 0f
+    private var pressPointY = 0f
+
+    /** 主线程 Handler：悬浮窗挂载/移除、Toast 必须在主线程执行 */
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     // ================================================================
     // 生命周期
@@ -148,7 +177,7 @@ class FaceControlForegroundService : LifecycleService() {
     private fun updateScreenSize() {
         val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = windowManager.currentWindowMetrics.bounds
+            val bounds = windowManager.maximumWindowMetrics.bounds
             screenWidth = bounds.width()
             screenHeight = bounds.height()
         } else {
@@ -227,6 +256,9 @@ class FaceControlForegroundService : LifecycleService() {
                     onActionDetected = { action ->
                         handleFaceAction(action)
                     },
+                    onHeadDirection = { dx, dy ->
+                        handleHeadDirection(dx, dy)
+                    },
                     onInitFailed = { error ->
                         Log.e(TAG, "人脸识别模型初始化失败", error)
                         handleCameraFailure()
@@ -302,9 +334,12 @@ class FaceControlForegroundService : LifecycleService() {
             faceAnalyzer = null
         }
 
+        removeCrosshairOverlay()
+
         if (::cameraExecutor.isInitialized) {
             cameraExecutor.shutdown()
         }
+        hitTestExecutor.shutdown()
     }
 
     // ================================================================
@@ -317,6 +352,19 @@ class FaceControlForegroundService : LifecycleService() {
             Log.w(TAG, "FaceAccessibilityService 未启动，无法执行手势")
             return
         }
+
+        // 双击眨眼 → 切换准心模式
+        if (action == FaceAnalyzer.FaceAction.DOUBLE_BLINK) {
+            toggleCrosshairMode()
+            return
+        }
+
+        // 准心模式下屏蔽其他手势
+        if (crosshairMode) {
+            Log.d(TAG, "准心模式中，忽略动作: $action")
+            return
+        }
+
         Log.d(TAG, "收到动作: $action")
         val isPortrait =
             resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
@@ -327,6 +375,106 @@ class FaceControlForegroundService : LifecycleService() {
             handleLandscapeMode(action, service)
         }
     }
+
+    // ================================================================
+    // 准心模式
+    // ================================================================
+
+    /**
+     * 切换准心模式：进入时显示光标并屏蔽其他手势，退出时记住当前位置
+     */
+    private fun toggleCrosshairMode() {
+        crosshairMode = !crosshairMode
+        faceAnalyzer?.nonBlinkActionsEnabled = !crosshairMode
+        faceAnalyzer?.longBlinkEnabled = !crosshairMode
+        if (crosshairMode) {
+            // 光标起始位置：上次选定的位置，否则屏幕中心
+            cursorX = if (selectedX > 0) selectedX else screenWidth / 2f
+            cursorY = if (selectedY > 0) selectedY else screenHeight / 2f
+            mainHandler.post {
+                showCrosshairOverlay()
+                crosshairView?.updateTarget(cursorX, cursorY)
+                Toast.makeText(this, "准心模式：偏头移动光标，双击眨眼确认", Toast.LENGTH_SHORT).show()
+            }
+        } else {
+            mainHandler.post {
+                removeCrosshairOverlay()
+                if (selectedX > 0 && selectedY > 0) {
+                    Toast.makeText(this, "已设定点击位置", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        Log.i(TAG, "准心模式: $crosshairMode")
+    }
+
+    /**
+     * 鼻尖位置回调（任意线程），换算为屏幕像素后更新光标
+     */
+    private fun handleHeadDirection(dx: Float, dy: Float) {
+        if (!crosshairMode) return
+        if (!dx.isFinite() || !dy.isFinite()) return
+        // 增量移动：方向向量 × 每帧步长，并夹在屏幕边距内，光标不越界
+        cursorX = (cursorX + dx * CROSSHAIR_STEP_PX)
+            .coerceIn(CROSSHAIR_MARGIN, screenWidth - CROSSHAIR_MARGIN)
+        cursorY = (cursorY + dy * CROSSHAIR_STEP_PX)
+            .coerceIn(CROSSHAIR_MARGIN, screenHeight - CROSSHAIR_MARGIN)
+        crosshairView?.updateTarget(cursorX, cursorY)
+        selectedX = cursorX
+        selectedY = cursorY
+
+        // 节流命中检测：更新「识别到的按钮」高亮
+        val now = SystemClock.uptimeMillis()
+        if (now - lastHitTestTime >= HIT_TEST_INTERVAL_MS) {
+            lastHitTestTime = now
+            performHitTestOverlay()
+        }
+    }
+
+    /**
+     * 命中检测：在后台线程遍历无障碍节点树，结果回主线程更新高亮。
+     * 遍历较重（视频页节点很多），绝不能在主线程执行，否则光标会卡住。
+     */
+    private fun performHitTestOverlay() {
+        if (!crosshairMode || hitTestInProgress) return
+        val service = FaceAccessibilityService.instance ?: return
+        val x = clickX()
+        val y = clickY()
+        hitTestInProgress = true
+        hitTestExecutor.execute {
+            try {
+                val result = service.hitTest(x, y)
+                mainHandler.post {
+                    if (crosshairMode) {
+                        crosshairView?.updateHitTest(result.clickTarget, result.longClickTarget)
+                    }
+                }
+            } finally {
+                hitTestInProgress = false
+            }
+        }
+    }
+
+    private fun showCrosshairOverlay() {
+        if (crosshairView != null) return
+        try {
+            crosshairView = CrosshairOverlayView.createAndAttach(this, screenWidth, screenHeight)
+        } catch (e: Exception) {
+            Log.e(TAG, "显示准心悬浮窗失败", e)
+        }
+    }
+
+    private fun removeCrosshairOverlay() {
+        val view = crosshairView ?: return
+        crosshairView = null
+        view.removeFromWindow()
+    }
+
+    /** 当前点击/长按位置：用户选定过则用选定位置，否则用屏幕中心 */
+    private fun clickX(): Float =
+        if (selectedX > 0) selectedX else px(CLICK_X_CENTER)
+
+    private fun clickY(): Float =
+        if (selectedY > 0) selectedY else py(CLICK_Y_CENTER)
 
     // ================================================================
     // 方案一：竖屏手势映射
@@ -353,13 +501,7 @@ class FaceControlForegroundService : LifecycleService() {
             // 长闭眼 → 点击屏幕（现在触发时 no longer 1.5s wait）
             FaceAnalyzer.FaceAction.LONG_BLINK -> {
                 Log.i(TAG, "LONG_BLINK → 点击屏幕")
-                service.performClickAction(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
-            }
-            FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
-                service.performSwipeAction(
-                    px(SWIPE_START_X_CENTER), py(SWIPE_START_Y_BOTTOM),
-                    px(SWIPE_END_X_CENTER), py(SWIPE_END_Y_TOP)
-                )
+                service.performSmartClick(clickX(), clickY())
             }
             FaceAnalyzer.FaceAction.SHAKE_LEFT -> {
                 service.performSwipeAction(
@@ -374,10 +516,15 @@ class FaceControlForegroundService : LifecycleService() {
                 )
             }
             FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                service.startContinuousPress(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
+                if (!service.performSmartLongClick(clickX(), clickY())) {
+                    val (px, py) = service.resolveTargetPoint(clickX(), clickY())
+                    pressPointX = px
+                    pressPointY = py
+                    service.startContinuousPress(px, py)
+                }
             }
             FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
+                service.stopContinuousPress(pressPointX, pressPointY)
             }
             else -> {}
         }
@@ -404,19 +551,18 @@ class FaceControlForegroundService : LifecycleService() {
                 )
             }
             FaceAnalyzer.FaceAction.LONG_BLINK -> {
-                service.performClickAction(px(CLICK_X_VIDEO_CENTER), py(CLICK_Y_VIDEO_CENTER))
-            }
-            FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
-                service.performSwipeAction(
-                    px(SWIPE_FAST_FORWARD_START_X), py(SWIPE_Y_VIDEO),
-                    px(SWIPE_FAST_FORWARD_END_X), py(SWIPE_Y_VIDEO)
-                )
+                service.performSmartClick(clickX(), clickY())
             }
             FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                service.startContinuousPress(px(CLICK_X_VIDEO_CENTER), py(CLICK_Y_VIDEO_CENTER))
+                if (!service.performSmartLongClick(clickX(), clickY())) {
+                    val (px, py) = service.resolveTargetPoint(clickX(), clickY())
+                    pressPointX = px
+                    pressPointY = py
+                    service.startContinuousPress(px, py)
+                }
             }
             FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(px(CLICK_X_VIDEO_CENTER), py(CLICK_Y_VIDEO_CENTER))
+                service.stopContinuousPress(pressPointX, pressPointY)
             }
             else -> {}
         }
