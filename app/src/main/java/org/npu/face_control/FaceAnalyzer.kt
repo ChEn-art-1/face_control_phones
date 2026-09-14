@@ -27,7 +27,6 @@ class FaceAnalyzer(
     companion object {
         private const val TAG = "FaceAnalyzer"
         private const val ENTER_CONTROL_DELAY_MS = 5000L
-        private const val EXIT_CONTROL_DELAY_MS = 3000L
         private const val SHORT_PRESS_MAX_MS = 500L
 
         private const val PHYSIO_BLINK_MAX_MS = 180L
@@ -47,9 +46,8 @@ class FaceAnalyzer(
     private var isInControlMode = false
     private var isReleased = false
 
-    // 进入/退出计时
+    // 进入计时
     private var enterControlStartTime = 0L
-    private var exitControlStartTime = 0L
 
     // 眨眼状态
     private var isEyesClosed = false
@@ -177,7 +175,10 @@ class FaceAnalyzer(
         // ---- 3. 核心状态机 ----
         handleStateMachine(eyesClosedNow, mouthOpenNow, landmarks)
 
-        // ---- 4. 在空闲模式下执行原有动作 ----
+        // ---- 4. 眨眼检测（两种模式下都运行：普通模式触发原有手势，光标模式下双眨眼退出）----
+        handleBlink(eyesClosedNow)
+
+        // ---- 5. 在空闲模式下执行原有动作 ----
         if (!isInControlMode) {
             handleOriginalActions(eyesClosedNow, mouthOpenNow, landmarks)
         }
@@ -234,27 +235,23 @@ class FaceAnalyzer(
                 mouthOpenStartTime = 0L
             }
 
-            // 3. 检测退出条件（闭眼≥3秒）
-            if (eyesClosedNow) {
-                if (exitControlStartTime == 0L) {
-                    exitControlStartTime = now
-                    Log.d(TAG, "⏱️ 开始计时退出控制模式...")
-                } else if (now - exitControlStartTime >= EXIT_CONTROL_DELAY_MS) {
-                    isInControlMode = false
-                    exitControlStartTime = 0L
-                    if (isMouthOpened) {
-                        isMouthOpened = false
-                        mouthOpenStartTime = 0L
-                        // 如果退出时还张着嘴，不触发释放
-                    }
-                    headPoseTracker.reset()
-                    onActionDetected(FaceAction.EXIT_CONTROL)
-                    Log.d(TAG, "🛑 退出虚拟光标控制模式")
-                }
-            } else {
-                exitControlStartTime = 0L
-            }
+            // 3. 退出条件：双眨眼（在 handleBlink/checkDoubleBlink 中检测并触发 exitControlMode）
         }
+    }
+
+    /**
+     * 退出虚拟光标控制模式（由光标模式下的双眨眼触发）
+     */
+    private fun exitControlMode() {
+        isInControlMode = false
+        if (isMouthOpened) {
+            isMouthOpened = false
+            mouthOpenStartTime = 0L
+            // 如果退出时还张着嘴，不触发释放
+        }
+        headPoseTracker.reset()
+        onActionDetected(FaceAction.EXIT_CONTROL)
+        Log.d(TAG, "🛑 双眨眼退出虚拟光标控制模式")
     }
 
     // ============================================================
@@ -263,7 +260,7 @@ class FaceAnalyzer(
     private fun handleOriginalActions(eyesClosedNow: Boolean, mouthOpenNow: Boolean, landmarks: List<NormalizedLandmark>) {
         val th = thresholds
 
-        handleBlink(eyesClosedNow)
+        // 眨眼检测已移至 processResult，两种模式下统一运行
 
         val nose = landmarks[1]
         val rightFaceEdge = landmarks[234]
@@ -334,8 +331,14 @@ class FaceAnalyzer(
         if (lastPhysioBlinkTimestamp != 0L &&
             interval in DOUBLE_BLINK_MIN_INTERVAL..DOUBLE_BLINK_MAX_INTERVAL
         ) {
-            onActionDetected(FaceAction.DOUBLE_BLINK)
             lastPhysioBlinkTimestamp = 0L
+            if (isInControlMode) {
+                // 光标模式下：双眨眼 → 退出光标模式
+                exitControlMode()
+            } else {
+                // 普通模式下：双眨眼 → 原有手势（向上滑动），保持不变
+                onActionDetected(FaceAction.DOUBLE_BLINK)
+            }
         } else {
             lastPhysioBlinkTimestamp = now
             onActionDetected(FaceAction.BLINK)
