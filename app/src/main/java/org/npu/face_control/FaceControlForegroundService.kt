@@ -333,8 +333,8 @@ class FaceControlForegroundService : LifecycleService() {
             }
 
             // ---- 原有功能（仅在空闲模式下生效） ----
-            FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
-                Log.d(TAG, "😉😉 双眨眼")
+            FaceAnalyzer.FaceAction.LOOK_UP -> {
+                Log.d(TAG, "🙆 抬头")
                 if (!isCursorVisible) {
                     service?.let { performSwipeUp(it) }
                 }

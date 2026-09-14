@@ -175,7 +175,7 @@ class FaceAnalyzer(
         // ---- 3. 核心状态机 ----
         handleStateMachine(eyesClosedNow, mouthOpenNow, landmarks)
 
-        // ---- 4. 眨眼检测（两种模式下都运行：普通模式触发原有手势，光标模式下双眨眼退出）----
+        // ---- 4. 眨眼检测（两种模式下都运行：双眨眼切换进入/退出光标模式）----
         handleBlink(eyesClosedNow)
 
         // ---- 5. 在空闲模式下执行原有动作 ----
@@ -240,6 +240,17 @@ class FaceAnalyzer(
     }
 
     /**
+     * 进入虚拟光标控制模式（由普通模式下的双眨眼触发）
+     */
+    private fun enterControlMode() {
+        isInControlMode = true
+        enterControlStartTime = 0L
+        headPoseTracker.reset()
+        onActionDetected(FaceAction.ENTER_CONTROL)
+        Log.d(TAG, "🚀 双眨眼进入虚拟光标控制模式")
+    }
+
+    /**
      * 退出虚拟光标控制模式（由光标模式下的双眨眼触发）
      */
     private fun exitControlMode() {
@@ -283,6 +294,9 @@ class FaceAnalyzer(
             val nodRatio = (noseTip.y() - forehead.y()) / faceHeight
             if (nodRatio > th.nodRatio) {
                 triggerShake(FaceAction.NOD)
+            } else if (nodRatio < 1f - th.nodRatio) {
+                // 抬头：与低头检测对称（阈值 = 1 - 点头阈值），触发向上滑动
+                triggerShake(FaceAction.LOOK_UP)
             }
         }
 
@@ -336,8 +350,8 @@ class FaceAnalyzer(
                 // 光标模式下：双眨眼 → 退出光标模式
                 exitControlMode()
             } else {
-                // 普通模式下：双眨眼 → 原有手势（向上滑动），保持不变
-                onActionDetected(FaceAction.DOUBLE_BLINK)
+                // 普通模式下：双眨眼 → 进入光标模式
+                enterControlMode()
             }
         } else {
             lastPhysioBlinkTimestamp = now
@@ -394,9 +408,9 @@ class FaceAnalyzer(
     // ============================================================
     enum class FaceAction {
         BLINK,
-        DOUBLE_BLINK,
         LONG_BLINK,
         NOD,
+        LOOK_UP,    // 抬头 → 向上滑动
         SHAKE_LEFT,
         SHAKE_RIGHT,
         MOUTH_OPEN,
