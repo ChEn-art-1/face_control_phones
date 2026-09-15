@@ -29,11 +29,13 @@ class FaceAnalyzer(
         private const val ENTER_CONTROL_DELAY_MS = 5000L
         private const val SHORT_PRESS_MAX_MS = 500L
 
-        private const val PHYSIO_BLINK_MAX_MS = 180L
-        private const val IGNORE_BLINK_MAX_MS = 350L
+        // 单次闭眼时长 <350ms 即算有效眨眼（刻意双眨眼的闭眼通常 200~300ms，原 180ms 太严格）
+        private const val PHYSIO_BLINK_MAX_MS = 350L
+        private const val IGNORE_BLINK_MAX_MS = 450L
         private const val LONG_BLINK_MAX_MS = 600L
         private const val DOUBLE_BLINK_MIN_INTERVAL = 100L
-        private const val DOUBLE_BLINK_MAX_INTERVAL = 569L
+        // 两次眨眼结束时刻的最大间隔 = 第二次闭眼时长 + 睁眼间隙，放宽到 900ms 更容易触发
+        private const val DOUBLE_BLINK_MAX_INTERVAL = 900L
         private const val SHAKE_LOCK_DURATION_MS = 1000L
         private const val FACE_LOST_TIMEOUT_MS = 2000L
     }

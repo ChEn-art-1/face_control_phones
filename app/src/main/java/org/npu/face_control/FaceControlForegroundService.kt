@@ -46,7 +46,7 @@ class FaceControlForegroundService : LifecycleService() {
     // ========== 光标移动参数 ==========
     private var currentX = 0f
     private var currentY = 0f
-    private val CURSOR_SPEED = 35f
+    private val CURSOR_SPEED = 90f
     private val CURSOR_SIZE = 80
     private val DEAD_ZONE = 0.02f
 
@@ -263,8 +263,9 @@ class FaceControlForegroundService : LifecycleService() {
     private fun moveCursor(deltaX: Float, deltaY: Float) {
         if (!isCursorVisible) return
 
-        val moveX = deltaX * CURSOR_SPEED
-        val moveY = deltaY * CURSOR_SPEED
+        // 非线性加速：增益随头部转动幅度增大（小幅转头精细定位，大幅转头快速移动）
+        val moveX = deltaX * CURSOR_SPEED * (1f + kotlin.math.abs(deltaX))
+        val moveY = deltaY * CURSOR_SPEED * (1f + kotlin.math.abs(deltaY))
 
         currentX = (currentX + moveX).coerceIn(0f, screenWidth.toFloat())
         currentY = (currentY + moveY).coerceIn(0f, screenHeight.toFloat())
