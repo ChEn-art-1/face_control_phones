@@ -21,6 +21,9 @@ class FaceAccessibilityService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private var isPressing = false
 
+    /** 双击两次点击之间的间隔（毫秒）：需大于系统合并不到的最小间隔，且小于应用双击判定阈值 */
+    private val DOUBLE_CLICK_GAP_MS = 70L
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
     override fun onInterrupt() {}
@@ -59,6 +62,36 @@ class FaceAccessibilityService : AccessibilityService() {
         leaf.getBoundsInScreen(rect)
         leaf.recycle()
         performClickAction(rect.exactCenterX(), rect.exactCenterY())
+    }
+
+    /**
+     * 智能双击：解析光标正下方最小可点击元素的中心，连发两次真实点击手势（间隔 DOUBLE_CLICK_GAP_MS）。
+     * 相比连续两次 ACTION_CLICK，真实点击序列既能触发两次 onClick，也能被 GestureDetector.onDoubleTap 识别。
+     */
+    fun performSmartDoubleClick(x: Float, y: Float) {
+        val root = rootInActiveWindow
+        var tx = x
+        var ty = y
+        if (root != null) {
+            val leaf = findSmallestContaining(root, x, y)
+            if (leaf != null) {
+                val clickable = findActionableSelfOrAncestor(leaf) { it.isClickable }
+                val rect = Rect()
+                if (clickable != null) {
+                    clickable.getBoundsInScreen(rect)
+                    clickable.recycle()
+                } else {
+                    leaf.getBoundsInScreen(rect)
+                }
+                leaf.recycle()
+                if (rect.width() > 0 && rect.height() > 0) {
+                    tx = rect.exactCenterX()
+                    ty = rect.exactCenterY()
+                }
+            }
+        }
+        performClickAction(tx, ty)
+        handler.postDelayed({ performClickAction(tx, ty) }, DOUBLE_CLICK_GAP_MS)
     }
 
     /**

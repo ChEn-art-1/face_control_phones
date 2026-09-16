@@ -40,7 +40,8 @@ class FaceAnalyzer(
     companion object {
         private const val TAG = "FaceAnalyzer"
 
-        private const val LONG_BLINK_MIN_MS = 800L
+        // 长闭眼时长阈值：闭眼超过该值触发 LONG_BLINK（现用于“进入/退出准心模式”的开关）
+        private const val LONG_BLINK_MIN_MS = 2000L
         // 短眨眼（生理性）时长上限：低于此值才计为双眨眼候选
         private const val SHORT_BLINK_MAX_MS = 300L
         // 双眨眼两段间隔窗口（放宽以提高灵敏度）
