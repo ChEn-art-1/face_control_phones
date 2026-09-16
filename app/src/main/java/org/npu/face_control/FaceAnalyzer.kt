@@ -16,12 +16,13 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
+import org.npu.face_control.config.ConfigRepository
 
 /**
  * 人脸动作识别引擎 — 核心算法模块
  *
  * 检测动作：
- *   LONG_BLINK    → 主动长闭眼（>= 800ms，闭眼期间即触发）
+ *   LONG_BLINK    → 主动长闭眼（时长可配，默认 >= 2000ms，闭眼期间即触发）
  *   DOUBLE_BLINK  → 双眨眼
  *   HEAD_DOWN     → 低头
  *   LOOK_UP       → 抬头
@@ -40,36 +41,16 @@ class FaceAnalyzer(
     companion object {
         private const val TAG = "FaceAnalyzer"
 
-        // 长闭眼时长阈值：闭眼超过该值触发 LONG_BLINK（现用于“进入/退出准心模式”的开关）
-        private const val LONG_BLINK_MIN_MS = 2000L
         // 短眨眼（生理性）时长上限：低于此值才计为双眨眼候选
         private const val SHORT_BLINK_MAX_MS = 300L
         // 双眨眼两段间隔窗口（放宽以提高灵敏度）
         private const val DOUBLE_BLINK_MIN_INTERVAL = 80L
-        private const val DOUBLE_BLINK_MAX_INTERVAL = 700L
         private const val BLINK_DISABLE_DURATION_MS = 1000L
         private const val SHAKE_LOCK_DURATION_MS = 1000L
         private const val FACE_LOST_TIMEOUT_MS = 2000L
         // 自适应 EAR 基数采集：每 N 帧统计一次平均值
         private const val EAR_BASELINE_INTERVAL = 120
-
-        // 准心模式偏头方向阈值：比基础手势阈值更小（死区更窄），小范围偏头即响应
-        private const val CROSSHAIR_SHAKE_LEFT_RATIO = 0.60f
-        private const val CROSSHAIR_SHAKE_RIGHT_RATIO = 0.40f
-        private const val CROSSHAIR_NOD_RATIO = 0.55f
-        private const val CROSSHAIR_LOOK_UP_RATIO = 0.45f
     }
-
-    data class Thresholds(
-        var earCloseRatio: Float = 0.50f,     // 当 EAR 低于基线 N% 时判为闭眼 (0.50=一半)
-        var shakeLeftRatio: Float = 0.75f,
-        var shakeRightRatio: Float = 0.25f,
-        var nodRatio: Float = 0.6f,
-        var lookUpRatio: Float = 0.35f,
-        var mouthOpenMar: Float = 0.5f
-    )
-
-    @Volatile var thresholds: Thresholds = Thresholds(); private set
 
     private var faceLandmarker: FaceLandmarker? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -154,7 +135,7 @@ class FaceAnalyzer(
         }
         lastFaceDetectedTime = System.currentTimeMillis()
         val landmarks = landmarksList[0]
-        val th = thresholds
+        val th = ConfigRepository.tuning
 
         // --- 眨眼检测 ---
         val leftEar = calculateEAR(landmarks, 362, 385, 387, 263, 373, 380)
@@ -199,9 +180,9 @@ class FaceAnalyzer(
                 triggerShake(FaceAction.SHAKE_RIGHT)
             }
 
-            if (ratio > CROSSHAIR_SHAKE_LEFT_RATIO) {
+            if (ratio > th.crosshairShakeLeftRatio) {
                 headDx = -1f
-            } else if (ratio < CROSSHAIR_SHAKE_RIGHT_RATIO) {
+            } else if (ratio < th.crosshairShakeRightRatio) {
                 headDx = 1f
             }
         }
@@ -218,9 +199,9 @@ class FaceAnalyzer(
                 isHeadDownLocked = false; isHeadUpLocked = false
             }
 
-            if (nodRatio > CROSSHAIR_NOD_RATIO) {
+            if (nodRatio > th.crosshairNodRatio) {
                 headDy = 1f
-            } else if (nodRatio < CROSSHAIR_LOOK_UP_RATIO) {
+            } else if (nodRatio < th.crosshairLookUpRatio) {
                 headDy = -1f
             }
         }
@@ -258,7 +239,7 @@ class FaceAnalyzer(
             // 闭眼持续中：检查是否达到长闭眼阈值
             if (!longBlinkFired && isBlinkControlEnabled && longBlinkEnabled) {
                 val duration = now - eyesClosedStartTime
-                if (duration >= LONG_BLINK_MIN_MS) {
+                if (duration >= ConfigRepository.tuning.longBlinkMinMs) {
                     longBlinkFired = true
                     Log.i(TAG, "✓ 触发 LONG_BLINK (闭眼${duration}ms)")
                     onActionDetected(FaceAction.LONG_BLINK)
@@ -283,7 +264,7 @@ class FaceAnalyzer(
 
     private fun checkDoubleBlink(now: Long) {
         val interval = now - lastPhysioBlinkTimestamp
-        if (lastPhysioBlinkTimestamp != 0L && interval in DOUBLE_BLINK_MIN_INTERVAL..DOUBLE_BLINK_MAX_INTERVAL) {
+        if (lastPhysioBlinkTimestamp != 0L && interval in DOUBLE_BLINK_MIN_INTERVAL..ConfigRepository.tuning.doubleBlinkMaxIntervalMs) {
             onActionDetected(FaceAction.DOUBLE_BLINK)
             lastPhysioBlinkTimestamp = 0L
         } else {
