@@ -76,7 +76,8 @@ class FaceAnalyzer(
         var shakeLeftRatio: Float = 0.75f,   // 摇头（向左侧）阈值
         var shakeRightRatio: Float = 0.25f,  // 摇头（向右侧）阈值
         var nodRatio: Float = 0.6f,          // 点头阈值
-        var mouthOpenMar: Float = 0.5f       // 张嘴 MAR 阈值
+        var mouthOpenMar: Float = 0.5f ,      // 张嘴 MAR 阈值
+        var eyebrowRaiseThreshold: Float = 0.045f // ✅新增：挑眉阈值，可后续在设置页调节，越大越难触发
     )
 
     @Volatile
@@ -97,6 +98,13 @@ class FaceAnalyzer(
     private var isEyesClosed = false
     private var eyesClosedStartTime: Long = 0L
     private var lastPhysioBlinkTimestamp: Long = 0L
+
+
+
+    // ✅===== 新增挑眉状态 =====
+    private var eyebrowWasRaised = false
+    private val EYEBROW_RAISE_LOCK_MS = 800L // 防抖，800ms内不能重复触发挑眉
+    private var lastEyebrowRaiseTime = 0L
 
     // 眨眼控制开关：识别到其他动作后临时禁用
     @Volatile
@@ -202,10 +210,13 @@ class FaceAnalyzer(
                 isMouthOpened = false
                 isShakeLocked = false
                 lastPhysioBlinkTimestamp = 0L
+                eyebrowWasRaised = false // ✅重置挑眉状态
+                lastEyebrowRaiseTime = 0L
                 lastFaceDetectedTime = System.currentTimeMillis()
             }
             return
         }
+
         lastFaceDetectedTime = System.currentTimeMillis()
 
         // 只处理第一张人脸（单用户场景）
@@ -265,6 +276,38 @@ class FaceAnalyzer(
                 }
             }
         }
+
+
+
+
+        // ---------------- 5. 【新增】挑眉检测逻辑 ----------------
+// 左眉峰70，左眼上眼睑159
+        val leftEyebrow = landmarks[70]
+        val leftUpperEye = landmarks[159]
+// 右眉峰300，右眼上眼睑386
+        val rightEyebrow = landmarks[300]
+        val rightUpperEye = landmarks[386]
+
+// 眉毛到上眼皮垂直距离（归一化坐标y）
+        val leftEyebrowEyeDist = leftUpperEye.y() - leftEyebrow.y()
+        val rightEyebrowEyeDist = rightUpperEye.y() - rightEyebrow.y()
+        val avgEyebrowDist = (leftEyebrowEyeDist + rightEyebrowEyeDist) / 2f
+
+        val nowTime = System.currentTimeMillis()
+        if(avgEyebrowDist > th.eyebrowRaiseThreshold) {
+            // 眉毛抬起来
+            if(!eyebrowWasRaised) {
+                eyebrowWasRaised = true
+                // 防抖锁，防止持续挑眉疯狂重复触发
+                if(nowTime - lastEyebrowRaiseTime > EYEBROW_RAISE_LOCK_MS){
+                    onActionDetected(FaceAction.EYEBROW_RAISE)
+                    lastEyebrowRaiseTime = nowTime
+                }
+            }
+        }else{
+            eyebrowWasRaised = false
+        }
+
     }
 
     // ============================================================
@@ -425,10 +468,12 @@ class FaceAnalyzer(
         BLINK,          // 单次生理性眨眼（可选使用）
         DOUBLE_BLINK,   // 双眨眼
         LONG_BLINK,     // 主动长闭眼（350~600ms）
+        EYEBROW_RAISE,  // ✅ 新增：挑眉
         NOD,
         SHAKE_LEFT,
         SHAKE_RIGHT,
         MOUTH_OPEN,
         MOUTH_CLOSE
     }
+
 }
