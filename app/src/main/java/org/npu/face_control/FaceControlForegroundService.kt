@@ -321,12 +321,22 @@ class FaceControlForegroundService : LifecycleService() {
         service: FaceAccessibilityService
     ) {
         when (action) {
-            FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
+//            FaceAnalyzer.FaceAction.DOUBLE_BLINK -> {
+//                service.performSwipeAction(
+//                    px(SWIPE_START_X_CENTER), py(SWIPE_START_Y_BOTTOM),
+//                    px(SWIPE_END_X_CENTER), py(SWIPE_END_Y_TOP)
+//                )
+//            }
+
+
+            FaceAnalyzer.FaceAction.EYEBROW_RAISE -> {
+                // ✅挑眉触发上滑，复用原来双眨眼的滑动参数
                 service.performSwipeAction(
                     px(SWIPE_START_X_CENTER), py(SWIPE_START_Y_BOTTOM),
                     px(SWIPE_END_X_CENTER), py(SWIPE_END_Y_TOP)
                 )
             }
+
             FaceAnalyzer.FaceAction.SHAKE_LEFT -> {
                 service.performSwipeAction(
                     px(SWIPE_X_RIGHT), py(SWIPE_Y_CENTER),
