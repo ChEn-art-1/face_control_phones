@@ -12,9 +12,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import org.npu.face_control.config.ConfigRepository
+import org.npu.face_control.ui.SettingsScreen
 import org.npu.face_control.ui.theme.FaceControlTheme
 
 class MainActivity : ComponentActivity() {
@@ -31,18 +34,25 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ConfigRepository.init(applicationContext)
         setContent {
             FaceControlTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    MainScreen(
-                        onStartService = { startFaceControlService() },
-                        onOpenAccessibility = { openAccessibilitySettings() },
-                        onOpenOverlay = { openOverlaySettings() },
-                        onRequestCamera = { requestPermissionLauncher.launch(Manifest.permission.CAMERA) }
-                    )
+                    var showSettings by rememberSaveable { mutableStateOf(false) }
+                    if (showSettings) {
+                        SettingsScreen(onBack = { showSettings = false })
+                    } else {
+                        MainScreen(
+                            onStartService = { startFaceControlService() },
+                            onOpenAccessibility = { openAccessibilitySettings() },
+                            onOpenOverlay = { openOverlaySettings() },
+                            onRequestCamera = { requestPermissionLauncher.launch(Manifest.permission.CAMERA) },
+                            onOpenSettings = { showSettings = true }
+                        )
+                    }
                 }
             }
         }
@@ -72,7 +82,8 @@ fun MainScreen(
     onStartService: () -> Unit,
     onOpenAccessibility: () -> Unit,
     onOpenOverlay: () -> Unit,
-    onRequestCamera: () -> Unit
+    onRequestCamera: () -> Unit,
+    onOpenSettings: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -83,28 +94,33 @@ fun MainScreen(
     ) {
         Text(text = "FaceControl MVP", style = MaterialTheme.typography.headlineMedium)
         Spacer(modifier = Modifier.height(32.dp))
-        
+
         Button(onClick = onRequestCamera, modifier = Modifier.fillMaxWidth()) {
             Text("1. Request Camera Permission")
         }
         Spacer(modifier = Modifier.height(8.dp))
-        
+
         Button(onClick = onOpenAccessibility, modifier = Modifier.fillMaxWidth()) {
             Text("2. Enable Accessibility Service")
         }
         Spacer(modifier = Modifier.height(8.dp))
-        
+
         Button(onClick = onOpenOverlay, modifier = Modifier.fillMaxWidth()) {
             Text("3. Enable Overlay Permission")
         }
         Spacer(modifier = Modifier.height(24.dp))
-        
+
         Button(
             onClick = onStartService,
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
         ) {
             Text("START FACECONTROL")
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+        OutlinedButton(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth()) {
+            Text("SETTINGS / 手势设置")
         }
     }
 }

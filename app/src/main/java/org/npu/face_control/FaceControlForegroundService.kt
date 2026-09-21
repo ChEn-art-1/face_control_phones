@@ -11,8 +11,11 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.hardware.display.DisplayManager
 import android.util.DisplayMetrics
 import android.util.Log
+import android.view.Display
+import android.view.Surface
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.camera.core.CameraSelector
@@ -21,6 +24,8 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
+import org.npu.face_control.config.ConfigRepository
+import org.npu.face_control.config.GestureBehavior
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -49,28 +54,16 @@ class FaceControlForegroundService : LifecycleService() {
         private const val ERROR_NOTIFICATION_ID = 2
 
         // ============================================================
-        // 手势坐标常量（竖屏模式）
+        // 手势坐标常量（屏幕百分比，横竖屏通用；由 px()/py() 换算为像素）
         // ============================================================
+        private const val X_CENTER = 0.5f
+        private const val Y_CENTER = 0.5f
+        private const val Y_TOP = 0.25f
+        private const val Y_BOTTOM = 0.75f
+        private const val X_LEFT = 0.1f
+        private const val X_RIGHT = 0.9f
 
-        // 滑动坐标
-        private const val SWIPE_START_X_CENTER = 0.5f
-        private const val SWIPE_END_X_CENTER = 0.5f
-        private const val SWIPE_START_Y_BOTTOM = 0.75f
-        private const val SWIPE_END_Y_TOP = 0.25f
-        private const val SWIPE_START_Y_TOP = 0.25f
-        private const val SWIPE_END_Y_BOTTOM = 0.75f
-
-        // 左右滑动坐标
-        private const val SWIPE_X_RIGHT = 0.9f
-        private const val SWIPE_X_LEFT = 0.1f
-        private const val SWIPE_Y_CENTER = 0.5f
-
-        // 点击/按压坐标
-        private const val CLICK_X_CENTER = 0.5f
-        private const val CLICK_Y_CENTER = 0.5f
-
-        // 准心光标移动：每帧步长（像素）与屏幕边距（像素，避免光标贴边）
-        private const val CROSSHAIR_STEP_PX = 12f
+        // 准心光标屏幕边距（像素，避免光标贴边）；步长改为读配置
         private const val CROSSHAIR_MARGIN = 30f
 
         // 命中检测（高亮命中目标）的节流间隔（毫秒）
@@ -89,6 +82,21 @@ class FaceControlForegroundService : LifecycleService() {
     /** 屏幕尺寸，用于百分比坐标换算（动态更新） */
     private var screenWidth = 1080
     private var screenHeight = 2400
+
+    /** 图像分析用例：保留引用，横竖屏切换时同步 targetRotation，使人脸关键点始终处于“显示坐标系” */
+    private var imageAnalysis: ImageAnalysis? = null
+
+    /** 当前是否竖屏（由显示旋转监听判定，用于手势模板路由，比 resources.configuration 可靠） */
+    @Volatile private var isDevicePortrait = true
+
+    /** 显示旋转监听：设备旋转时同步 CameraX targetRotation，从根上解耦手势与朝向 */
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId == Display.DEFAULT_DISPLAY) applyDisplayOrientation()
+        }
+    }
 
     // ================================================================
     // 准心模式（用户自选点击/长按位置）
@@ -130,6 +138,7 @@ class FaceControlForegroundService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
+        ConfigRepository.init(applicationContext)
         cameraExecutor = Executors.newSingleThreadExecutor()
         updateScreenSize()
 
@@ -139,6 +148,9 @@ class FaceControlForegroundService : LifecycleService() {
 
         // 2. 启动 CameraX + 人脸检测流水线
         startCamera()
+
+        // 3. 注册显示旋转监听：横竖屏切换时同步 CameraX targetRotation，解耦手势与朝向
+        registerDisplayOrientationListener()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -151,6 +163,12 @@ class FaceControlForegroundService : LifecycleService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        try {
+            (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
+                .unregisterDisplayListener(displayListener)
+        } catch (e: Exception) {
+            Log.w(TAG, "反注册显示监听失败", e)
+        }
         releaseResources()
     }
 
@@ -172,7 +190,7 @@ class FaceControlForegroundService : LifecycleService() {
     // ================================================================
 
     /**
-     * 动态获取屏幕真实尺寸，兼容不同 API 版本
+     * 动态获取屏幕真实尺寸，兼容不同 API 版本。
      */
     private fun updateScreenSize() {
         val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -188,6 +206,32 @@ class FaceControlForegroundService : LifecycleService() {
             screenHeight = metrics.heightPixels
         }
         Log.d(TAG, "屏幕尺寸更新: ${screenWidth}x${screenHeight}")
+    }
+
+    /** 当前默认显示屏旋转常量（Surface.ROTATION_0/90/180/270） */
+    private fun currentDisplayRotation(): Int {
+        val dm = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+        return dm.getDisplay(Display.DEFAULT_DISPLAY).rotation
+    }
+
+    /**
+     * 应用当前显示朝向：刷新屏幕尺寸与路由标志，并同步 CameraX 目标旋转。
+     * 关键点：同步 targetRotation 让 MediaPipe 关键点始终处于“显示坐标系”，
+     * 这样无论横屏竖屏，低头/摇头/光标移动的方向语义都一致，实现与朝向解耦。
+     */
+    private fun applyDisplayOrientation() {
+        updateScreenSize()
+        val rot = currentDisplayRotation()
+        isDevicePortrait = (rot == Surface.ROTATION_0 || rot == Surface.ROTATION_180)
+        imageAnalysis?.targetRotation = rot
+        Log.i(TAG, "显示朝向更新: rotation=$rot 竖屏=$isDevicePortrait")
+    }
+
+    /** 注册显示旋转监听（系统已融合陀螺仪/加速度计给出显示旋转，比 resources.configuration 可靠） */
+    private fun registerDisplayOrientationListener() {
+        val dm = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+        dm.registerDisplayListener(displayListener, null)
+        applyDisplayOrientation()
     }
 
     /** 百分比 X 坐标 → 像素值 */
@@ -245,10 +289,13 @@ class FaceControlForegroundService : LifecycleService() {
                 cameraProvider = cameraProviderFuture.get()
 
                 // ----- 图像分析器配置 -----
-                val imageAnalysis = ImageAnalysis.Builder()
+                val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                     .build()
+                // 初始目标旋转跟随当前显示方向，保证关键点一开始就处于显示坐标系
+                analysis.targetRotation = currentDisplayRotation()
+                imageAnalysis = analysis
 
                 // ----- 人脸分析器 -----
                 val analyzer = FaceAnalyzer(
@@ -265,7 +312,7 @@ class FaceControlForegroundService : LifecycleService() {
                     }
                 )
                 faceAnalyzer = analyzer
-                imageAnalysis.setAnalyzer(cameraExecutor, analyzer)
+                analysis.setAnalyzer(cameraExecutor, analyzer)
 
                 // ----- 选择摄像头：优先前置，不可用时用后置 -----
                 val cameraSelector = try {
@@ -280,12 +327,12 @@ class FaceControlForegroundService : LifecycleService() {
 
                 try {
                     // 绑定到当前 Service 的 Lifecycle
-                    cameraProvider?.bindToLifecycle(this, cameraSelector, imageAnalysis)
+                    cameraProvider?.bindToLifecycle(this, cameraSelector, analysis)
                     Log.d(TAG, "摄像头启动成功")
                 } catch (e: IllegalArgumentException) {
                     // 前置失败，回退到后置
                     Log.w(TAG, "前置启动失败，回退后置摄像头")
-                    cameraProvider?.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, imageAnalysis)
+                    cameraProvider?.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
                     Log.d(TAG, "摄像头启动成功(后置)")
                 }
 
@@ -353,27 +400,27 @@ class FaceControlForegroundService : LifecycleService() {
             return
         }
 
-        // 双击眨眼 → 切换准心模式
-        if (action == FaceAnalyzer.FaceAction.DOUBLE_BLINK) {
+        // 依据「准心 / 竖屏 / 横屏」三张配置表查表取行为（配置由设置页热更新）
+        val cfg = ConfigRepository.effective()
+        val inCrosshair = crosshairMode
+        val table = when {
+            inCrosshair -> cfg.crosshairMap
+            isDevicePortrait -> cfg.portraitMap
+            else -> cfg.landscapeMap
+        }
+        val behavior = table[action] ?: GestureBehavior.NONE
+        Log.d(TAG, "动作 $action → $behavior (准心=$inCrosshair 竖屏=$isDevicePortrait)")
+
+        // 切换准心模式：需在 updateScreenSize 之前处理（与旧逻辑一致）
+        if (behavior == GestureBehavior.TOGGLE_CROSSHAIR) {
             toggleCrosshairMode()
             return
         }
+        if (behavior == GestureBehavior.NONE) return
 
-        // 准心模式下屏蔽其他手势
-        if (crosshairMode) {
-            Log.d(TAG, "准心模式中，忽略动作: $action")
-            return
-        }
-
-        Log.d(TAG, "收到动作: $action")
-        val isPortrait =
-            resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
-
-        if (isPortrait) {
-            handlePortraitMode(action, service)
-        } else {
-            handleLandscapeMode(action, service)
-        }
+        // 刷新屏幕尺寸，保证 px()/py() 换算准确
+        updateScreenSize()
+        dispatchBehavior(behavior, service)
     }
 
     // ================================================================
@@ -381,12 +428,13 @@ class FaceControlForegroundService : LifecycleService() {
     // ================================================================
 
     /**
-     * 切换准心模式：进入时显示光标并屏蔽其他手势，退出时记住当前位置
+     * 切换准心模式：由「闭眼超过 2 秒」(LONG_BLINK) 触发，进入/退出为同一姿势。
+     * 准心模式内：双眨眼(DOUBLE_BLINK)=单击。
+     * 注意：进入后不再关闭 nonBlinkActionsEnabled / longBlinkEnabled，
+     * 否则准心模式内的双眨眼(单击)/长闭眼(退出)无法被识别。
      */
     private fun toggleCrosshairMode() {
         crosshairMode = !crosshairMode
-        faceAnalyzer?.nonBlinkActionsEnabled = !crosshairMode
-        faceAnalyzer?.longBlinkEnabled = !crosshairMode
         if (crosshairMode) {
             // 光标起始位置：上次选定的位置，否则屏幕中心
             cursorX = if (selectedX > 0) selectedX else screenWidth / 2f
@@ -394,13 +442,17 @@ class FaceControlForegroundService : LifecycleService() {
             mainHandler.post {
                 showCrosshairOverlay()
                 crosshairView?.updateTarget(cursorX, cursorY)
-                Toast.makeText(this, "准心模式：偏头移动光标，双击眨眼确认", Toast.LENGTH_SHORT).show()
+                Toast.makeText(
+                    this,
+                    "准心模式：偏头移动光标 · 双眨眼=单击 · 闭眼2秒=退出",
+                    Toast.LENGTH_SHORT
+                ).show()
             }
         } else {
             mainHandler.post {
                 removeCrosshairOverlay()
                 if (selectedX > 0 && selectedY > 0) {
-                    Toast.makeText(this, "已设定点击位置", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "已退出准心模式", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -408,15 +460,18 @@ class FaceControlForegroundService : LifecycleService() {
     }
 
     /**
-     * 鼻尖位置回调（任意线程），换算为屏幕像素后更新光标
+     * 鼻尖位置回调（任意线程），换算为屏幕像素后更新光标。
+     * dx/dy 已由 FaceAnalyzer 在“显示坐标系”下给出（CameraX targetRotation 同步保证了这一点），
+     * 因此横竖屏无需额外旋转，光标方向与设备朝向自动一致。
      */
     private fun handleHeadDirection(dx: Float, dy: Float) {
         if (!crosshairMode) return
         if (!dx.isFinite() || !dy.isFinite()) return
-        // 增量移动：方向向量 × 每帧步长，并夹在屏幕边距内，光标不越界
-        cursorX = (cursorX + dx * CROSSHAIR_STEP_PX)
+        // 步长读配置（设置页可调），增量移动并夹在屏幕边距内，光标不越界
+        val step = ConfigRepository.tuning.crosshairStepPx
+        cursorX = (cursorX + dx * step)
             .coerceIn(CROSSHAIR_MARGIN, screenWidth - CROSSHAIR_MARGIN)
-        cursorY = (cursorY + dy * CROSSHAIR_STEP_PX)
+        cursorY = (cursorY + dy * step)
             .coerceIn(CROSSHAIR_MARGIN, screenHeight - CROSSHAIR_MARGIN)
         crosshairView?.updateTarget(cursorX, cursorY)
         selectedX = cursorX
@@ -471,100 +526,51 @@ class FaceControlForegroundService : LifecycleService() {
 
     /** 当前点击/长按位置：用户选定过则用选定位置，否则用屏幕中心 */
     private fun clickX(): Float =
-        if (selectedX > 0) selectedX else px(CLICK_X_CENTER)
+        if (selectedX > 0) selectedX else px(X_CENTER)
 
     private fun clickY(): Float =
-        if (selectedY > 0) selectedY else py(CLICK_Y_CENTER)
+        if (selectedY > 0) selectedY else py(Y_CENTER)
 
     // ================================================================
-    // 方案一：竖屏手势映射
+    // 手势行为派发（由配置映射表驱动，竖屏/横屏/准心共用）
     // ================================================================
-    private fun handlePortraitMode(
-        action: FaceAnalyzer.FaceAction,
-        service: FaceAccessibilityService
-    ) {
-        when (action) {
-            // 低头 → 下滑
-            FaceAnalyzer.FaceAction.HEAD_DOWN -> {
-                service.performSwipeAction(
-                    px(SWIPE_START_X_CENTER), py(SWIPE_START_Y_TOP),
-                    px(SWIPE_END_X_CENTER), py(SWIPE_END_Y_BOTTOM)
-                )
-            }
-            // 抬头 → 上滑
-            FaceAnalyzer.FaceAction.LOOK_UP -> {
-                service.performSwipeAction(
-                    px(SWIPE_START_X_CENTER), py(SWIPE_START_Y_BOTTOM),
-                    px(SWIPE_END_X_CENTER), py(SWIPE_END_Y_TOP)
-                )
-            }
-            // 长闭眼 → 点击屏幕（现在触发时 no longer 1.5s wait）
-            FaceAnalyzer.FaceAction.LONG_BLINK -> {
-                Log.i(TAG, "LONG_BLINK → 点击屏幕")
-                service.performSmartClick(clickX(), clickY())
-            }
-            FaceAnalyzer.FaceAction.SHAKE_LEFT -> {
-                service.performSwipeAction(
-                    px(SWIPE_X_RIGHT), py(SWIPE_Y_CENTER),
-                    px(SWIPE_X_LEFT), py(SWIPE_Y_CENTER)
-                )
-            }
-            FaceAnalyzer.FaceAction.SHAKE_RIGHT -> {
-                service.performSwipeAction(
-                    px(SWIPE_X_LEFT), py(SWIPE_Y_CENTER),
-                    px(SWIPE_X_RIGHT), py(SWIPE_Y_CENTER)
-                )
-            }
-            FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                if (!service.performSmartLongClick(clickX(), clickY())) {
-                    val (px, py) = service.resolveTargetPoint(clickX(), clickY())
-                    pressPointX = px
-                    pressPointY = py
-                    service.startContinuousPress(px, py)
-                }
-            }
-            FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(pressPointX, pressPointY)
-            }
-            else -> {}
-        }
-    }
 
-    // ================================================================
-    // 方案二：横屏手势映射
-    // ================================================================
-    private fun handleLandscapeMode(
-        action: FaceAnalyzer.FaceAction,
-        service: FaceAccessibilityService
-    ) {
-        when (action) {
-            FaceAnalyzer.FaceAction.HEAD_DOWN -> {
-                service.performSwipeAction(
-                    px(SWIPE_START_X_CENTER), py(SWIPE_START_Y_TOP),
-                    px(SWIPE_END_X_CENTER), py(SWIPE_END_Y_BOTTOM)
-                )
-            }
-            FaceAnalyzer.FaceAction.LOOK_UP -> {
-                service.performSwipeAction(
-                    px(SWIPE_START_X_CENTER), py(SWIPE_START_Y_BOTTOM),
-                    px(SWIPE_END_X_CENTER), py(SWIPE_END_Y_TOP)
-                )
-            }
-            FaceAnalyzer.FaceAction.LONG_BLINK -> {
-                service.performSmartClick(clickX(), clickY())
-            }
-            FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
-                if (!service.performSmartLongClick(clickX(), clickY())) {
-                    val (px, py) = service.resolveTargetPoint(clickX(), clickY())
-                    pressPointX = px
-                    pressPointY = py
-                    service.startContinuousPress(px, py)
+    /**
+     * 执行一个配置映射得到的行为。
+     * 坐标来源：准心模式用光标位置；普通模式用「选定位置 / 屏幕中心」。
+     */
+    private fun dispatchBehavior(behavior: GestureBehavior, service: FaceAccessibilityService) {
+        val inCrosshair = crosshairMode
+        val x = if (inCrosshair) cursorX else clickX()
+        val y = if (inCrosshair) cursorY else clickY()
+
+        when (behavior) {
+            GestureBehavior.NONE -> Unit
+            GestureBehavior.SWIPE_UP -> service.performSwipeAction(
+                px(X_CENTER), py(Y_BOTTOM), px(X_CENTER), py(Y_TOP)
+            )
+            GestureBehavior.SWIPE_DOWN -> service.performSwipeAction(
+                px(X_CENTER), py(Y_TOP), px(X_CENTER), py(Y_BOTTOM)
+            )
+            GestureBehavior.SWIPE_LEFT -> service.performSwipeAction(
+                px(X_RIGHT), py(Y_CENTER), px(X_LEFT), py(Y_CENTER)
+            )
+            GestureBehavior.SWIPE_RIGHT -> service.performSwipeAction(
+                px(X_LEFT), py(Y_CENTER), px(X_RIGHT), py(Y_CENTER)
+            )
+            GestureBehavior.CLICK -> service.performSmartClick(x, y)
+            GestureBehavior.DOUBLE_CLICK -> service.performSmartDoubleClick(x, y)
+            GestureBehavior.LONG_CLICK -> service.performSmartLongClick(x, y)
+            GestureBehavior.PRESS_START -> {
+                if (!service.performSmartLongClick(x, y)) {
+                    val (tx, ty) = service.resolveTargetPoint(x, y)
+                    pressPointX = tx
+                    pressPointY = ty
+                    service.startContinuousPress(tx, ty)
                 }
             }
-            FaceAnalyzer.FaceAction.MOUTH_CLOSE -> {
-                service.stopContinuousPress(pressPointX, pressPointY)
-            }
-            else -> {}
+            GestureBehavior.PRESS_END -> service.stopContinuousPress(pressPointX, pressPointY)
+            GestureBehavior.TOGGLE_CROSSHAIR -> toggleCrosshairMode()
         }
     }
 }
