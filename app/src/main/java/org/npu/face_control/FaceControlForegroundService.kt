@@ -6,6 +6,10 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -23,6 +27,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 /**
  * ============================================================
@@ -65,12 +70,18 @@ class FaceControlForegroundService : LifecycleService() {
         private const val SWIPE_X_LEFT = 0.1f
         private const val SWIPE_Y_CENTER = 0.5f
 
+        // 横屏快进/快退滑动坐标（缩短距离，控制快进量约 15 秒级别）
+        private const val SWIPE_FF_START_X = 0.35f
+        private const val SWIPE_FF_END_X = 0.65f
+        private const val SWIPE_RW_START_X = 0.65f
+        private const val SWIPE_RW_END_X = 0.35f
+        private const val SWIPE_Y_VIDEO = 0.5f
+
         // 点击/按压坐标
         private const val CLICK_X_CENTER = 0.5f
         private const val CLICK_Y_CENTER = 0.5f
 
-        // 准心光标移动：每帧步长（像素）与屏幕边距（像素，避免光标贴边）
-        private const val CROSSHAIR_STEP_PX = 12f
+        // 准心光标移动的屏幕边距（像素，避免光标贴边）
         private const val CROSSHAIR_MARGIN = 30f
 
         // 命中检测（高亮命中目标）的节流间隔（毫秒）
@@ -93,6 +104,42 @@ class FaceControlForegroundService : LifecycleService() {
     // ================================================================
     // 准心模式（用户自选点击/长按位置）
     // ================================================================
+
+    /** 面部控制是否暂停（画圈切换）。暂停时除画圈恢复外，所有面部动作不响应 */
+    @Volatile private var paused = false
+
+    /** 设备物理方向（基于重力传感器，不受旋转锁定影响）：true = 竖屏，false = 横屏 */
+    @Volatile private var isPhysicallyPortrait = true
+
+    private var sensorManager: SensorManager? = null
+    private var gravitySensor: Sensor? = null
+
+    private val gravityListener = object : SensorEventListener {
+        private var lastPortrait: Boolean? = null
+
+        override fun onSensorChanged(event: SensorEvent) {
+            val gx = event.values[0]
+            val gy = event.values[1]
+            // 平放（重力几乎全在 z 轴）时不更新，保持上次方向，避免抖动
+            if (abs(gx) + abs(gy) < 4.0f) return
+            // |gy| 占主导 = 竖屏（重力沿 y 轴），|gx| 占主导 = 横屏
+            val portrait = abs(gy) >= abs(gx)
+            isPhysicallyPortrait = portrait
+            faceAnalyzer?.isLandscape = !portrait
+
+            val prev = lastPortrait
+            if (prev != null && prev != portrait) {
+                val msg = if (portrait) "已切换到竖屏" else "已切换到横屏"
+                mainHandler.post {
+                    Toast.makeText(this@FaceControlForegroundService, msg, Toast.LENGTH_SHORT).show()
+                }
+                Log.i(TAG, msg)
+            }
+            lastPortrait = portrait
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
 
     /** 准心模式是否开启 */
     @Volatile private var crosshairMode = false
@@ -130,8 +177,10 @@ class FaceControlForegroundService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
+        FaceControlConfig.load(this)
         cameraExecutor = Executors.newSingleThreadExecutor()
         updateScreenSize()
+        registerGravitySensor()
 
         // 1. 创建前台服务通知（系统必须，否则 Android 8+ 会崩溃）
         createNotificationChannel()
@@ -139,6 +188,21 @@ class FaceControlForegroundService : LifecycleService() {
 
         // 2. 启动 CameraX + 人脸检测流水线
         startCamera()
+    }
+
+    /** 注册重力传感器，用于检测设备物理横竖（不受旋转锁定影响） */
+    private fun registerGravitySensor() {
+        try {
+            sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+            gravitySensor = sensorManager?.getDefaultSensor(Sensor.TYPE_GRAVITY)
+                ?: sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+            gravitySensor?.let {
+                sensorManager?.registerListener(gravityListener, it, SensorManager.SENSOR_DELAY_UI)
+            }
+            Log.d(TAG, "重力传感器注册: ${gravitySensor != null}")
+        } catch (e: Exception) {
+            Log.e(TAG, "注册重力传感器失败", e)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -336,6 +400,14 @@ class FaceControlForegroundService : LifecycleService() {
 
         removeCrosshairOverlay()
 
+        try {
+            sensorManager?.unregisterListener(gravityListener)
+        } catch (e: Exception) {
+            Log.e(TAG, "注销重力传感器失败", e)
+        }
+        sensorManager = null
+        gravitySensor = null
+
         if (::cameraExecutor.isInitialized) {
             cameraExecutor.shutdown()
         }
@@ -353,9 +425,28 @@ class FaceControlForegroundService : LifecycleService() {
             return
         }
 
+        // 连续上下摆头两次 → 切换暂停/恢复（全局，任何模式、包括暂停中都响应）
+        if (action == FaceAnalyzer.FaceAction.NOD_TWICE) {
+            togglePaused()
+            return
+        }
+
+        // 暂停中：屏蔽其它动作（画圈已在上方处理）
+        if (paused) {
+            Log.d(TAG, "已暂停，忽略动作: $action")
+            return
+        }
+
         // 双击眨眼 → 切换准心模式
         if (action == FaceAnalyzer.FaceAction.DOUBLE_BLINK) {
             toggleCrosshairMode()
+            return
+        }
+
+        // 连续摇头两次 → 系统返回键
+        if (action == FaceAnalyzer.FaceAction.SHAKE_TWICE) {
+            Log.i(TAG, "SHAKE_TWICE → 返回键")
+            service.performBackAction()
             return
         }
 
@@ -366,14 +457,30 @@ class FaceControlForegroundService : LifecycleService() {
         }
 
         Log.d(TAG, "收到动作: $action")
-        val isPortrait =
-            resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+        val isPortrait = isPhysicallyPortrait
 
         if (isPortrait) {
             handlePortraitMode(action, service)
         } else {
             handleLandscapeMode(action, service)
         }
+    }
+
+    /**
+     * 切换暂停状态：暂停时若在准心模式则先退出准心模式（移除悬浮窗），
+     * 使面部控制完全静止；仅画圈可恢复。
+     */
+    private fun togglePaused() {
+        paused = !paused
+        if (paused && crosshairMode) {
+            crosshairMode = false
+            faceAnalyzer?.nonBlinkActionsEnabled = true
+            faceAnalyzer?.longBlinkEnabled = true
+            mainHandler.post { removeCrosshairOverlay() }
+        }
+        val msg = if (paused) "已暂停面部控制" else "已恢复面部控制"
+        mainHandler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+        Log.i(TAG, "面部控制暂停: $paused")
     }
 
     // ================================================================
@@ -414,9 +521,10 @@ class FaceControlForegroundService : LifecycleService() {
         if (!crosshairMode) return
         if (!dx.isFinite() || !dy.isFinite()) return
         // 增量移动：方向向量 × 每帧步长，并夹在屏幕边距内，光标不越界
-        cursorX = (cursorX + dx * CROSSHAIR_STEP_PX)
+        val step = FaceControlConfig.config.crosshairStepPx
+        cursorX = (cursorX + dx * step)
             .coerceIn(CROSSHAIR_MARGIN, screenWidth - CROSSHAIR_MARGIN)
-        cursorY = (cursorY + dy * CROSSHAIR_STEP_PX)
+        cursorY = (cursorY + dy * step)
             .coerceIn(CROSSHAIR_MARGIN, screenHeight - CROSSHAIR_MARGIN)
         crosshairView?.updateTarget(cursorX, cursorY)
         selectedX = cursorX
@@ -538,6 +646,19 @@ class FaceControlForegroundService : LifecycleService() {
         service: FaceAccessibilityService
     ) {
         when (action) {
+            // 左扭头 → 快退（向左滑），右扭头 → 快进（向右滑）
+            FaceAnalyzer.FaceAction.SHAKE_LEFT -> {
+                service.performSwipeAction(
+                    px(SWIPE_RW_START_X), py(SWIPE_Y_VIDEO),
+                    px(SWIPE_RW_END_X), py(SWIPE_Y_VIDEO)
+                )
+            }
+            FaceAnalyzer.FaceAction.SHAKE_RIGHT -> {
+                service.performSwipeAction(
+                    px(SWIPE_FF_START_X), py(SWIPE_Y_VIDEO),
+                    px(SWIPE_FF_END_X), py(SWIPE_Y_VIDEO)
+                )
+            }
             FaceAnalyzer.FaceAction.HEAD_DOWN -> {
                 service.performSwipeAction(
                     px(SWIPE_START_X_CENTER), py(SWIPE_START_Y_TOP),
@@ -551,7 +672,8 @@ class FaceControlForegroundService : LifecycleService() {
                 )
             }
             FaceAnalyzer.FaceAction.LONG_BLINK -> {
-                service.performSmartClick(clickX(), clickY())
+                // 横屏：长闭眼 = 播放/暂停（多数视频 App 需两次点击：先唤出控制栏，再切换）
+                service.performDoubleClick(px(CLICK_X_CENTER), py(CLICK_Y_CENTER))
             }
             FaceAnalyzer.FaceAction.MOUTH_OPEN -> {
                 if (!service.performSmartLongClick(clickX(), clickY())) {

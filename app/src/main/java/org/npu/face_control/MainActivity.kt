@@ -15,6 +15,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import org.npu.face_control.ui.SettingsScreen
+import org.npu.face_control.ui.TestScreen
 import org.npu.face_control.ui.theme.FaceControlTheme
 
 class MainActivity : ComponentActivity() {
@@ -31,18 +33,29 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        FaceControlConfig.load(this)
         setContent {
             FaceControlTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    MainScreen(
-                        onStartService = { startFaceControlService() },
-                        onOpenAccessibility = { openAccessibilitySettings() },
-                        onOpenOverlay = { openOverlaySettings() },
-                        onRequestCamera = { requestPermissionLauncher.launch(Manifest.permission.CAMERA) }
-                    )
+                    var screen by remember { mutableStateOf(Screen.Main) }
+                    when (screen) {
+                        Screen.Main -> MainScreen(
+                            onStartService = { startFaceControlService() },
+                            onOpenAccessibility = { openAccessibilitySettings() },
+                            onOpenOverlay = { openOverlaySettings() },
+                            onRequestCamera = { requestPermissionLauncher.launch(Manifest.permission.CAMERA) },
+                            onOpenSettings = { screen = Screen.Settings }
+                        )
+                        Screen.Settings -> SettingsScreen(
+                            context = this,
+                            onBack = { screen = Screen.Main },
+                            onOpenTest = { screen = Screen.Test }
+                        )
+                        Screen.Test -> TestScreen(onBack = { screen = Screen.Settings })
+                    }
                 }
             }
         }
@@ -72,7 +85,8 @@ fun MainScreen(
     onStartService: () -> Unit,
     onOpenAccessibility: () -> Unit,
     onOpenOverlay: () -> Unit,
-    onRequestCamera: () -> Unit
+    onRequestCamera: () -> Unit,
+    onOpenSettings: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -83,22 +97,22 @@ fun MainScreen(
     ) {
         Text(text = "FaceControl MVP", style = MaterialTheme.typography.headlineMedium)
         Spacer(modifier = Modifier.height(32.dp))
-        
+
         Button(onClick = onRequestCamera, modifier = Modifier.fillMaxWidth()) {
             Text("1. Request Camera Permission")
         }
         Spacer(modifier = Modifier.height(8.dp))
-        
+
         Button(onClick = onOpenAccessibility, modifier = Modifier.fillMaxWidth()) {
             Text("2. Enable Accessibility Service")
         }
         Spacer(modifier = Modifier.height(8.dp))
-        
+
         Button(onClick = onOpenOverlay, modifier = Modifier.fillMaxWidth()) {
             Text("3. Enable Overlay Permission")
         }
         Spacer(modifier = Modifier.height(24.dp))
-        
+
         Button(
             onClick = onStartService,
             modifier = Modifier.fillMaxWidth(),
@@ -106,5 +120,12 @@ fun MainScreen(
         ) {
             Text("START FACECONTROL")
         }
+        Spacer(modifier = Modifier.height(12.dp))
+
+        OutlinedButton(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth()) {
+            Text("灵敏度设置")
+        }
     }
 }
+
+private enum class Screen { Main, Settings, Test }

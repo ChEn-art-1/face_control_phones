@@ -33,6 +33,21 @@ class FaceAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * 连续点击两次（部分视频 App 需要两次点击才切换播放/暂停：
+     * 第一次唤出控制栏，第二次才触发播放/暂停）。
+     * intervalMs 为两次点击间隔，稍长以避开系统「双击」手势（通常 <300ms）。
+     */
+    fun performDoubleClick(x: Float, y: Float, intervalMs: Long = 200L) {
+        performClickAction(x, y)
+        handler.postDelayed({ performClickAction(x, y) }, intervalMs)
+    }
+
+    /** 模拟系统返回键（退出当前页面 / 返回上一级） */
+    fun performBackAction(): Boolean {
+        return performGlobalAction(GLOBAL_ACTION_BACK)
+    }
+
+    /**
      * 智能点击：优先对「光标正下方」的最小可点击元素执行 ACTION_CLICK；
      * 若该元素不可点击则点击其边界中心，再不行就精确坐标点击。
      * 关键：以「包含光标的最小节点」为准，而不是按半径找最近节点，避免吸附到相邻按钮。

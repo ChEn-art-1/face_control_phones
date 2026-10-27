@@ -21,14 +21,19 @@ import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
  * 人脸动作识别引擎 — 核心算法模块
  *
  * 检测动作：
- *   LONG_BLINK    → 主动长闭眼（>= 800ms，闭眼期间即触发）
+ *   LONG_BLINK    → 主动长闭眼（闭眼期间即触发）
  *   DOUBLE_BLINK  → 双眨眼
  *   HEAD_DOWN     → 低头
  *   LOOK_UP       → 抬头
  *   SHAKE_LEFT    → 向左扭头
  *   SHAKE_RIGHT   → 向右扭头
+ *   SHAKE_TWICE   → 连续摇头两次（左右左右）
+ *   NOD_TWICE     → 连续上下摆头两次（下上下上）
  *   MOUTH_OPEN    → 张嘴
  *   MOUTH_CLOSE   → 闭嘴
+ *
+ * 所有灵敏度阈值从 [FaceControlConfig] 读取（每帧 @Volatile，实时生效），
+ * 实时检测值写入 [LiveMetrics] 供测试页展示。
  */
 class FaceAnalyzer(
     context: Context,
@@ -40,35 +45,26 @@ class FaceAnalyzer(
     companion object {
         private const val TAG = "FaceAnalyzer"
 
-        private const val LONG_BLINK_MIN_MS = 800L
         // 短眨眼（生理性）时长上限：低于此值才计为双眨眼候选
         private const val SHORT_BLINK_MAX_MS = 300L
-        // 双眨眼两段间隔窗口（放宽以提高灵敏度）
-        private const val DOUBLE_BLINK_MIN_INTERVAL = 80L
-        private const val DOUBLE_BLINK_MAX_INTERVAL = 700L
         private const val BLINK_DISABLE_DURATION_MS = 1000L
-        private const val SHAKE_LOCK_DURATION_MS = 1000L
         private const val FACE_LOST_TIMEOUT_MS = 2000L
-        // 自适应 EAR 基数采集：每 N 帧统计一次平均值
-        private const val EAR_BASELINE_INTERVAL = 120
-
-        // 准心模式偏头方向阈值：比基础手势阈值更小（死区更窄），小范围偏头即响应
-        private const val CROSSHAIR_SHAKE_LEFT_RATIO = 0.60f
-        private const val CROSSHAIR_SHAKE_RIGHT_RATIO = 0.40f
-        private const val CROSSHAIR_NOD_RATIO = 0.55f
-        private const val CROSSHAIR_LOOK_UP_RATIO = 0.45f
+        // 连续摆头/点头序列超时（未被单次确认打断时的最长窗口）
+        private const val SHAKE_SEQUENCE_TIMEOUT_MS = 2500L
+        // 双向阈值（左/右、下/上）之间的最小死区，防止两个阈值交叉导致方向判定失效
+        private const val DEAD_ZONE_MIN = 0.05f
+        // 横屏时额外旋转角：让送入 MediaPipe 的人脸保持正立（横屏时 rotationDegrees 会让人脸侧躺）。
+        // 真机若横屏仍检测不到人脸，尝试改成 -90
+        private const val LANDSCAPE_EXTRA_ROTATION_DEG = 90f
+        // 方向中心基线学习率与最大偏移：补偿摄像头位置导致的「正对时比例不居中」
+        private const val BASELINE_LEARN_RATE = 0.02f
+        private const val BASELINE_MAX_OFFSET = 0.25f
+        // 眨眼参考基线：睁眼 EAR 归一化目标（横竖屏对齐到该值）
+        private const val REFERENCE_EAR = 0.3f
+        // 横竖屏切换后的快速校准：帧数（约 2 秒）与快速学习率
+        private const val CALIBRATION_FRAMES = 60
+        private const val FAST_LEARN_RATE = 0.1f
     }
-
-    data class Thresholds(
-        var earCloseRatio: Float = 0.50f,     // 当 EAR 低于基线 N% 时判为闭眼 (0.50=一半)
-        var shakeLeftRatio: Float = 0.75f,
-        var shakeRightRatio: Float = 0.25f,
-        var nodRatio: Float = 0.6f,
-        var lookUpRatio: Float = 0.35f,
-        var mouthOpenMar: Float = 0.5f
-    )
-
-    @Volatile var thresholds: Thresholds = Thresholds(); private set
 
     private var faceLandmarker: FaceLandmarker? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -88,22 +84,55 @@ class FaceAnalyzer(
     /** 准心模式下置为 false，屏蔽长闭眼点击（双击眨眼仍有效） */
     @Volatile var longBlinkEnabled = true
 
-    // 自适应 EAR 基线
-    private var earBaseline = 0.25f  // 默认睁眼 EAR 典型值，会动态更新
-    private var earSampleSum = 0f
-    private var earSampleCount = 0
+    /** 设备是否横屏（由服务端传感器更新），用于横屏时把图像转正，保证人脸检测正常 */
+    @Volatile var isLandscape = false
+
+    // 睁眼 EAR 基线：趋近当前睁眼 EAR，用于归一化对齐横竖屏
+    private var earBaseline = REFERENCE_EAR
+
+    // 摇头/点头方向中心基线：补偿摄像头位置导致的「正对时比例不居中（≠0.5）」
+    private var shakeCenterOffset = 0f
+    private var nodCenterOffset = 0f
+    private var lastLandscape = false
+    private var calibratingFrames = 0
 
     // 其他动作
-    private var isShakeLocked = false
     private var isMouthOpened = false
-    private var isHeadDownLocked = false
-    private var isHeadUpLocked = false
     private var lastFaceDetectedTime = 0L
 
     private val enableBlinkRunnable = Runnable { isBlinkControlEnabled = true }
-    private val unlockShakeRunnable = Runnable { isShakeLocked = false }
-    private val unlockHeadDownRunnable = Runnable { isHeadDownLocked = false }
-    private val unlockHeadUpRunnable = Runnable { isHeadUpLocked = false }
+
+    // 摇头序列检测（单次滑动延迟确认 + 连续摇头两次）
+    private var currentShakeSide = 0
+    private val shakeSideEntries = mutableListOf<Int>()
+    private var shakeSeqStartTime = 0L
+    private val confirmShakeRunnable = Runnable {
+        val entries = shakeSideEntries.toList()
+        if (entries.size == 1) {
+            val dir = entries[0]
+            emit(if (dir < 0) FaceAction.SHAKE_LEFT else FaceAction.SHAKE_RIGHT)
+        }
+        // 多段但不构成连续摇头两次的（如同侧重复），暂不派发
+        shakeSideEntries.clear()
+        currentShakeSide = 0
+        shakeSeqStartTime = 0L
+    }
+
+    // 点头序列检测（单次点头/抬头延迟确认 + 连续上下摆头两次）
+    private var currentNodSide = 0
+    private val nodSideEntries = mutableListOf<Int>()
+    private var nodSeqStartTime = 0L
+    private val confirmNodRunnable = Runnable {
+        val entries = nodSideEntries.toList()
+        if (entries.size == 1) {
+            val dir = entries[0]
+            emit(if (dir > 0) FaceAction.HEAD_DOWN else FaceAction.LOOK_UP)
+        }
+        // 多段但不构成连续上下摆头两次的，暂不派发
+        nodSideEntries.clear()
+        currentNodSide = 0
+        nodSeqStartTime = 0L
+    }
 
     @Volatile private var isReleased = false
 
@@ -130,8 +159,14 @@ class FaceAnalyzer(
         if (isReleased || landmarker == null) { image.close(); return }
         try {
             val originalBitmap = image.toBitmap()
-            val rotatedBitmap = if (image.imageInfo.rotationDegrees != 0) {
-                val matrix = Matrix().apply { postRotate(image.imageInfo.rotationDegrees.toFloat()) }
+            // 竖屏按 rotationDegrees 转正；横屏额外转 LANDSCAPE_EXTRA_ROTATION_DEG，
+            // 让送入 MediaPipe 的人脸始终保持正立（否则横屏人脸侧躺、检测失败）
+            val baseRotation = image.imageInfo.rotationDegrees
+            val extra = if (isLandscape) LANDSCAPE_EXTRA_ROTATION_DEG else 0f
+            var total = (baseRotation + extra) % 360f
+            if (total < 0f) total += 360f
+            val rotatedBitmap = if (total != 0f) {
+                val matrix = Matrix().apply { postRotate(total) }
                 Bitmap.createBitmap(originalBitmap, 0, 0, originalBitmap.width, originalBitmap.height, matrix, true)
             } else originalBitmap
             val mpImage = BitmapImageBuilder(rotatedBitmap).build()
@@ -146,14 +181,25 @@ class FaceAnalyzer(
         if (isReleased) return
         val landmarksList = result.faceLandmarks()
         if (landmarksList.isNullOrEmpty()) {
+            LiveMetrics.isTracking = false
             if (System.currentTimeMillis() - lastFaceDetectedTime > FACE_LOST_TIMEOUT_MS) {
                 resetAllStates()
             }
             return
         }
         lastFaceDetectedTime = System.currentTimeMillis()
+        LiveMetrics.isTracking = true
+        // 检测到横竖屏切换时，重置方向中心基线、EAR 基线，进入快速校准期
+        if (lastLandscape != isLandscape) {
+            shakeCenterOffset = 0f
+            nodCenterOffset = 0f
+            earBaseline = REFERENCE_EAR
+            calibratingFrames = CALIBRATION_FRAMES
+            lastLandscape = isLandscape
+        }
+        if (calibratingFrames > 0) calibratingFrames--
         val landmarks = landmarksList[0]
-        val th = thresholds
+        val cfg = FaceControlConfig.config
 
         // --- 眨眼检测 ---
         val leftEar = calculateEAR(landmarks, 362, 385, 387, 263, 373, 380)
@@ -161,21 +207,20 @@ class FaceAnalyzer(
         val avgEar = (leftEar + rightEar) / 2f
 
         frameCount++
-        // 自适应基线更新
+        // 睁眼时基线趋近当前睁眼 EAR（校准期用快学习率，2 秒快速恢复）
         if (!isEyesClosed) {
-            earSampleSum += avgEar
-            earSampleCount++
-            if (earSampleCount >= EAR_BASELINE_INTERVAL) {
-                earBaseline = earSampleSum / earSampleCount
-                Log.d(TAG, "EAR 基线更新: $earBaseline")
-                earSampleSum = 0f; earSampleCount = 0
-            }
+            val rate = if (calibratingFrames > 0) FAST_LEARN_RATE else BASELINE_LEARN_RATE
+            earBaseline += (avgEar - earBaseline) * rate
         }
-        val earCloseThreshold = earBaseline * th.earCloseRatio
-        handleBlink(avgEar < earCloseThreshold)
+        // 归一化到参考基线 0.3，使横竖屏睁眼 EAR 对齐；闭眼阈值用固定绝对值
+        val normalizedEar = avgEar * (REFERENCE_EAR / earBaseline.coerceAtLeast(0.05f))
+        val earCloseThreshold = cfg.blinkEarThreshold
+        LiveMetrics.ear = normalizedEar
+        LiveMetrics.earThreshold = earCloseThreshold
+        handleBlink(normalizedEar < earCloseThreshold)
 
         if (frameCount % 60L == 0L) {
-            Log.d(TAG, "帧${frameCount}: EAR=$avgEar 基线=$earBaseline 闭眼阈值=$earCloseThreshold 闭眼=${avgEar < earCloseThreshold}")
+            Log.d(TAG, "帧${frameCount}: EAR=$avgEar 基线=$earBaseline 归一化=$normalizedEar 闭眼阈值=$earCloseThreshold 闭眼=${normalizedEar < earCloseThreshold}")
         }
 
         // --- 偏头方向（供准心模式光标移动，输出 -1/0/+1 方向向量）---
@@ -187,40 +232,70 @@ class FaceAnalyzer(
 
         var headDx = 0f  // +1 右, -1 左
         var headDy = 0f  // +1 下, -1 上
+        val calibrating = calibratingFrames > 0
 
-        // 摇头（横向）：基础手势用 th 阈值（不变），准心方向用更小的阈值
+        // 摇头（横向）：基础手势用基础阈值，准心方向用准心阈值
         val faceWidth = leftFaceEdge.x() - rightFaceEdge.x()
         if (faceWidth > 0) {
             val ratio = (nose.x() - rightFaceEdge.x()) / faceWidth
-            if (ratio > th.shakeLeftRatio) {
-                triggerShake(FaceAction.SHAKE_LEFT)
-            } else if (ratio < th.shakeRightRatio) {
-                triggerShake(FaceAction.SHAKE_RIGHT)
-            }
+            val effRatio = ratio + shakeCenterOffset
+            LiveMetrics.shakeRatio = effRatio
+            val (shakeLeftTh, shakeRightTh) = normalized(cfg.shakeLeftRatio, cfg.shakeRightRatio)
 
-            if (ratio > CROSSHAIR_SHAKE_LEFT_RATIO) {
-                headDx = -1f
-            } else if (ratio < CROSSHAIR_SHAKE_RIGHT_RATIO) {
-                headDx = 1f
+            if (calibrating) {
+                // 快速校准期：强制把中心拉到 0.5，并抑制手势（防止初始偏移误判成持续偏头）
+                shakeCenterOffset = (shakeCenterOffset + (0.5f - effRatio) * FAST_LEARN_RATE)
+                    .coerceIn(-BASELINE_MAX_OFFSET, BASELINE_MAX_OFFSET)
+                handleShake(0)
+            } else {
+                val shakeDir = when {
+                    effRatio > shakeLeftTh -> -1
+                    effRatio < shakeRightTh -> 1
+                    else -> 0
+                }
+                handleShake(shakeDir)
+                if (shakeDir == 0) {
+                    shakeCenterOffset = (shakeCenterOffset + (0.5f - effRatio) * BASELINE_LEARN_RATE)
+                        .coerceIn(-BASELINE_MAX_OFFSET, BASELINE_MAX_OFFSET)
+                }
+                val (crossLeftTh, crossRightTh) = normalized(cfg.crosshairShakeLeftRatio, cfg.crosshairShakeRightRatio)
+                if (effRatio > crossLeftTh) {
+                    headDx = -1f
+                } else if (effRatio < crossRightTh) {
+                    headDx = 1f
+                }
             }
         }
 
-        // 低头/抬头（纵向）：基础手势用 th 阈值（不变），准心方向用更小的阈值
+        // 低头/抬头（纵向）：基础手势用基础阈值，准心方向用准心阈值
         val faceHeight = dist(forehead, chin)
         if (faceHeight > 0) {
             val nodRatio = (nose.y() - forehead.y()) / faceHeight
-            if (nodRatio > th.nodRatio) {
-                triggerHeadDown()
-            } else if (nodRatio < th.lookUpRatio) {
-                triggerLookUp()
-            } else {
-                isHeadDownLocked = false; isHeadUpLocked = false
-            }
+            val effNod = nodRatio + nodCenterOffset
+            LiveMetrics.nodRatio = effNod
+            val (nodDownTh, nodUpTh) = normalized(cfg.nodRatio, cfg.lookUpRatio)
 
-            if (nodRatio > CROSSHAIR_NOD_RATIO) {
-                headDy = 1f
-            } else if (nodRatio < CROSSHAIR_LOOK_UP_RATIO) {
-                headDy = -1f
+            if (calibrating) {
+                nodCenterOffset = (nodCenterOffset + (0.5f - effNod) * FAST_LEARN_RATE)
+                    .coerceIn(-BASELINE_MAX_OFFSET, BASELINE_MAX_OFFSET)
+                handleNod(0)
+            } else {
+                val nodDir = when {
+                    effNod > nodDownTh -> 1
+                    effNod < nodUpTh -> -1
+                    else -> 0
+                }
+                handleNod(nodDir)
+                if (nodDir == 0) {
+                    nodCenterOffset = (nodCenterOffset + (0.5f - effNod) * BASELINE_LEARN_RATE)
+                        .coerceIn(-BASELINE_MAX_OFFSET, BASELINE_MAX_OFFSET)
+                }
+                val (crossDownTh, crossUpTh) = normalized(cfg.crosshairNodRatio, cfg.crosshairLookUpRatio)
+                if (effNod > crossDownTh) {
+                    headDy = 1f
+                } else if (effNod < crossUpTh) {
+                    headDy = -1f
+                }
             }
         }
 
@@ -233,7 +308,8 @@ class FaceAnalyzer(
         val mouthWidth = dist(leftMouth, rightMouth)
         if (mouthWidth > 0) {
             val mar = mouthHeight / mouthWidth
-            if (mar > th.mouthOpenMar) {
+            LiveMetrics.mar = mar
+            if (mar > cfg.mouthOpenMar) {
                 if (!isMouthOpened) { isMouthOpened = true; dispatchNonBlinkAction(FaceAction.MOUTH_OPEN) }
             } else {
                 if (isMouthOpened) { isMouthOpened = false; dispatchNonBlinkAction(FaceAction.MOUTH_CLOSE) }
@@ -241,11 +317,19 @@ class FaceAnalyzer(
         }
     }
 
+    /** 统一派发动作并记录到实时指标 */
+    private fun emit(action: FaceAction) {
+        LiveMetrics.lastAction = action.name
+        LiveMetrics.lastActionTime = System.currentTimeMillis()
+        onActionDetected(action)
+    }
+
     // ============================================================
     // 眨眼状态机 — 闭眼达到阈值立即触发，不等睁眼
     // ============================================================
     private fun handleBlink(eyesClosedNow: Boolean) {
         val now = System.currentTimeMillis()
+        val cfg = FaceControlConfig.config
 
         if (eyesClosedNow) {
             if (!isEyesClosed) {
@@ -257,10 +341,10 @@ class FaceAnalyzer(
             // 闭眼持续中：检查是否达到长闭眼阈值
             if (!longBlinkFired && isBlinkControlEnabled && longBlinkEnabled) {
                 val duration = now - eyesClosedStartTime
-                if (duration >= LONG_BLINK_MIN_MS) {
+                if (duration >= cfg.longBlinkMinMs) {
                     longBlinkFired = true
                     Log.i(TAG, "✓ 触发 LONG_BLINK (闭眼${duration}ms)")
-                    onActionDetected(FaceAction.LONG_BLINK)
+                    emit(FaceAction.LONG_BLINK)
                 }
             }
         } else {
@@ -281,39 +365,118 @@ class FaceAnalyzer(
     }
 
     private fun checkDoubleBlink(now: Long) {
+        val cfg = FaceControlConfig.config
         val interval = now - lastPhysioBlinkTimestamp
-        if (lastPhysioBlinkTimestamp != 0L && interval in DOUBLE_BLINK_MIN_INTERVAL..DOUBLE_BLINK_MAX_INTERVAL) {
-            onActionDetected(FaceAction.DOUBLE_BLINK)
+        if (lastPhysioBlinkTimestamp != 0L &&
+            interval in cfg.doubleBlinkMinInterval..cfg.doubleBlinkMaxInterval
+        ) {
+            emit(FaceAction.DOUBLE_BLINK)
             lastPhysioBlinkTimestamp = 0L
         } else {
             lastPhysioBlinkTimestamp = now
         }
     }
 
-    private fun triggerShake(action: FaceAction) {
-        if (isShakeLocked) return
-        isShakeLocked = true
-        dispatchNonBlinkAction(action)
-        mainHandler.postDelayed(unlockShakeRunnable, SHAKE_LOCK_DURATION_MS)
+    /**
+     * 摇头序列检测：
+     * 单次摇头（进入一侧后不再切换）经延迟确认后派发 SHAKE_LEFT/RIGHT；
+     * 连续摇头两次（方向交替 4 段，如 左-右-左-右）派发 SHAKE_TWICE。
+     */
+    private fun handleShake(dir: Int) {
+        if (dir == 0) {
+            currentShakeSide = 0
+            return
+        }
+        if (dir == currentShakeSide) return
+        // 进入新的侧（0→非0 或 -1↔+1）
+        currentShakeSide = dir
+        shakeSideEntries.add(dir)
+        Log.d(TAG, "摇头段 dir=$dir 序列=${shakeSideEntries.joinToString()}")
+        val now = System.currentTimeMillis()
+        if (shakeSideEntries.size == 1) {
+            shakeSeqStartTime = now
+        }
+
+        // 超时保护：太久没完成，只保留最后一段重新开始
+        if (now - shakeSeqStartTime > SHAKE_SEQUENCE_TIMEOUT_MS) {
+            val last = dir
+            shakeSideEntries.clear()
+            shakeSideEntries.add(last)
+            shakeSeqStartTime = now
+        }
+
+        // 连续摇头两次 = 最近 4 段方向交替
+        if (shakeSideEntries.size >= 4 && isAlternating(shakeSideEntries.takeLast(4))) {
+            emit(FaceAction.SHAKE_TWICE)
+            shakeSideEntries.clear()
+            shakeSeqStartTime = 0L
+            mainHandler.removeCallbacks(confirmShakeRunnable)
+            return
+        }
+
+        // 重置延迟确认定时器：这段时间内没有新切换才确认单次滑动
+        mainHandler.removeCallbacks(confirmShakeRunnable)
+        mainHandler.postDelayed(confirmShakeRunnable, FaceControlConfig.config.shakeConfirmDelayMs)
     }
 
-    private fun triggerHeadDown() {
-        if (isHeadDownLocked) return
-        isHeadDownLocked = true
-        dispatchNonBlinkAction(FaceAction.HEAD_DOWN)
-        mainHandler.postDelayed(unlockHeadDownRunnable, SHAKE_LOCK_DURATION_MS)
+    /** 规范化双向阈值：保证高阈值 >= 低阈值 + 最小死区，避免交叉后方向判定失效 */
+    private fun normalized(high: Float, low: Float): Pair<Float, Float> {
+        val hi = maxOf(high, low + DEAD_ZONE_MIN).coerceAtMost(1f)
+        val lo = minOf(low, high - DEAD_ZONE_MIN).coerceAtLeast(0f)
+        return hi to lo
     }
 
-    private fun triggerLookUp() {
-        if (isHeadUpLocked) return
-        isHeadUpLocked = true
-        dispatchNonBlinkAction(FaceAction.LOOK_UP)
-        mainHandler.postDelayed(unlockHeadUpRunnable, SHAKE_LOCK_DURATION_MS)
+    private fun isAlternating(list: List<Int>): Boolean {
+        for (i in 1 until list.size) {
+            if (list[i] == list[i - 1]) return false
+        }
+        return true
+    }
+
+    /**
+     * 点头序列检测：
+     * 单次点头/抬头（进入一侧后不再切换）经延迟确认后派发 HEAD_DOWN/LOOK_UP；
+     * 连续上下摆头两次（方向交替 4 段，如 下-上-下-上）派发 NOD_TWICE。
+     */
+    private fun handleNod(dir: Int) {
+        if (dir == 0) {
+            currentNodSide = 0
+            return
+        }
+        if (dir == currentNodSide) return
+        currentNodSide = dir
+        nodSideEntries.add(dir)
+        Log.d(TAG, "点头段 dir=$dir 序列=${nodSideEntries.joinToString()}")
+        val now = System.currentTimeMillis()
+        if (nodSideEntries.size == 1) {
+            nodSeqStartTime = now
+        }
+
+        // 超时保护：太久没完成，只保留最后一段重新开始
+        if (now - nodSeqStartTime > SHAKE_SEQUENCE_TIMEOUT_MS) {
+            val last = dir
+            nodSideEntries.clear()
+            nodSideEntries.add(last)
+            nodSeqStartTime = now
+        }
+
+        // 连续上下摆头两次 = 最近 4 段方向交替
+        if (nodSideEntries.size >= 4 && isAlternating(nodSideEntries.takeLast(4))) {
+            emit(FaceAction.NOD_TWICE)
+            nodSideEntries.clear()
+            nodSeqStartTime = 0L
+            mainHandler.removeCallbacks(confirmNodRunnable)
+            return
+        }
+
+        // 重置延迟确认定时器：这段时间内没有新切换才确认单次点头/抬头
+        mainHandler.removeCallbacks(confirmNodRunnable)
+        mainHandler.postDelayed(confirmNodRunnable, FaceControlConfig.config.shakeConfirmDelayMs)
     }
 
     private fun dispatchNonBlinkAction(action: FaceAction) {
         if (!nonBlinkActionsEnabled) return
-        onActionDetected(action)
+        emit(action)
         disableBlinkTemporarily()
     }
 
@@ -330,11 +493,16 @@ class FaceAnalyzer(
         isEyesClosed = false
         longBlinkFired = false
         isMouthOpened = false
-        isShakeLocked = false
-        isHeadDownLocked = false
-        isHeadUpLocked = false
         lastPhysioBlinkTimestamp = 0L
-        earSampleSum = 0f; earSampleCount = 0
+        // 重置摇头序列与点头序列检测
+        shakeSideEntries.clear()
+        currentShakeSide = 0
+        shakeSeqStartTime = 0L
+        mainHandler.removeCallbacks(confirmShakeRunnable)
+        nodSideEntries.clear()
+        currentNodSide = 0
+        nodSeqStartTime = 0L
+        mainHandler.removeCallbacks(confirmNodRunnable)
     }
 
     private fun calculateEAR(l: List<NormalizedLandmark>, p1: Int, p2: Int, p3: Int, p4: Int, p5: Int, p6: Int): Float =
@@ -355,6 +523,7 @@ class FaceAnalyzer(
 
     enum class FaceAction {
         DOUBLE_BLINK, LONG_BLINK, HEAD_DOWN, LOOK_UP,
-        SHAKE_LEFT, SHAKE_RIGHT, MOUTH_OPEN, MOUTH_CLOSE, BLINK
+        SHAKE_LEFT, SHAKE_RIGHT, SHAKE_TWICE, NOD_TWICE,
+        MOUTH_OPEN, MOUTH_CLOSE, BLINK
     }
 }
