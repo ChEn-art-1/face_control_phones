@@ -12,10 +12,13 @@ It is designed for people with limited mobility, or for any situation where hand
 
 - **Real-time Face Tracking**: Powered by **Google MediaPipe Face Landmarker**, detecting 468 3D facial landmarks in real time.
 - **Continuous Background Monitoring**: Combines **CameraX** with a **Foreground Service**, so the app keeps responding even when it is in the background or the screen is locked.
-- **Global Gesture Simulation**: Uses the **Accessibility Service API** to simulate swipe, click, and long-press gestures in any app — no Root required.
-- **Crosshair Mode (custom click point)**: Enter a crosshair mode with a double blink, move the cursor by tilting your head, and pick the exact spot for click and long-press actions. The app automatically detects interactive elements near the cursor and highlights them.
+- **Global Gesture Simulation**: Uses the **Accessibility Service API** to simulate swipe, click, long-press and back gestures in any app — no Root required.
+- **Crosshair Mode (custom click point)**: Enter a crosshair mode with a double blink, move the cursor by tilting your head, and pick the exact spot for click and long-press actions. The app highlights the interactive element under the cursor.
 - **Smart Click Detection**: Click and long-press actions prefer the actual clickable element under the cursor, then fall back to raw coordinate gestures.
-- **Anti-Mistouch Logic**: An EAR (Eye Aspect Ratio) state machine with an adaptive baseline distinguishes natural blinks from deliberate commands.
+- **Portrait / Landscape Awareness**: A gravity sensor detects the physical device orientation (independent of the system rotation lock), so portrait and landscape each get their own gesture mapping.
+- **Tunable Sensitivity**: A settings screen lets you adjust every gesture threshold, with a live test screen that visualizes detection values in real time.
+- **Compound Gestures**: Shake your head twice to go back, and nod up-and-down twice to pause/resume face control.
+- **Anti-Mistouch Logic**: An EAR (Eye Aspect Ratio) state machine distinguishes natural blinks from deliberate commands.
 
 ---
 
@@ -41,22 +44,22 @@ It is designed for people with limited mobility, or for any situation where hand
 | **Shake Left** | Swipe left | Back / previous item |
 | **Shake Right** | Swipe right | Forward / next item |
 | **Long Blink** (~0.8s) | Click at the selected point | Confirm / select / pause |
-| **Mouth Open** | Long-press at the selected point | Long-press menu / speed control |
-| **Mouth Close** | Release | Release the long-press |
+| **Mouth Open / Close** | Long-press / release | Long-press menu / speed control |
 | **Double Blink** | Toggle crosshair mode | Enter / exit crosshair mode |
+| **Shake Twice** | Back key | Exit the current page |
+| **Nod Twice** | Pause / resume face control | Temporarily suspend all gestures |
 
 ### Landscape Mode (video playback / fullscreen)
 
 | Facial Gesture | Simulated Action | Typical Use |
 | :--- | :--- | :--- |
-| **Head Down** (look down) | Swipe down | Volume / brightness down |
-| **Head Up** (look up) | Swipe up | Volume / brightness up |
-| **Long Blink** (~0.8s) | Click at the selected point | Play / pause |
-| **Mouth Open** | Long-press at the selected point | Player menu / speed control |
-| **Mouth Close** | Release | Release the long-press |
+| **Shake Left / Right** | Rewind / fast-forward | Seek backward / forward |
+| **Head Down / Up** | Swipe down / up | Brightness / volume down / up |
+| **Long Blink** (~0.8s) | Play / pause (double-click center) | Toggle playback |
+| **Mouth Open / Close** | Long-press / release | Player menu / speed control |
 | **Double Blink** | Toggle crosshair mode | Enter / exit crosshair mode |
-
-> In landscape mode, head-shake gestures are currently not mapped.
+| **Shake Twice** | Back key | Exit the current page |
+| **Nod Twice** | Pause / resume face control | Temporarily suspend all gestures |
 
 ---
 
@@ -69,6 +72,20 @@ Double-blink to enter crosshair mode. A crosshair cursor appears, and you move i
 - **Orange frame** = where a **long-press** (mouth open) will land.
 
 The frames highlight the actual interactive element detected under the cursor, so you always see exactly what will be pressed. Double-blink again to confirm the position and exit. After that, click and long-press actions use the position you selected (or the screen center, if you never set one).
+
+---
+
+## 🎚️ Sensitivity Tuning
+
+The app ships with a settings screen where you can fine-tune every gesture threshold:
+
+- Blink (eye-closed EAR threshold, long-blink duration, double-blink interval)
+- Head tilt (shake left/right, nod up/down)
+- Mouth open (MAR threshold)
+- Crosshair cursor (move thresholds and step size)
+- Compound-gesture confirmation delay
+
+A companion **test screen** shows live detection values (EAR, nose ratios, MAR) together with the current thresholds, so you can see exactly when a gesture triggers as you adjust the sliders. All settings persist across restarts.
 
 ---
 
@@ -98,6 +115,7 @@ Manually enable the following in system settings:
 - Tap "START FACECONTROL" to activate the camera and gesture detection
 - A "FaceControl is active" notification indicates the service is running
 - Double-blink to enter crosshair mode, tilt your head to position the cursor, and double-blink again to confirm
+- Open "灵敏度设置" (Sensitivity) to tune thresholds, and use the test screen to preview detection
 
 ---
 
@@ -107,13 +125,17 @@ Manually enable the following in system settings:
 app/
 └── src/main/
     ├── java/org/npu/face_control/
-    │   ├── MainActivity.kt                     # Compose UI + permission management
+    │   ├── MainActivity.kt                     # Compose UI + permission management + navigation
     │   ├── FaceAnalyzer.kt                     # MediaPipe face analysis engine (core algorithm)
     │   ├── FaceMath.kt                         # Pure math utilities (EAR, distance)
     │   ├── FaceControlForegroundService.kt     # Foreground service + CameraX pipeline + gesture dispatch
     │   ├── FaceAccessibilityService.kt         # Gesture execution + interactive-element detection
     │   ├── CrosshairOverlayView.kt             # Crosshair overlay + target highlighting
-    │   └── ui/theme/                           # Compose theme (Color, Theme, Typography)
+    │   ├── FaceControlConfig.kt                # Sensitivity configuration (persisted)
+    │   ├── LiveMetrics.kt                      # Live detection metrics for the test screen
+    │   └── ui/
+    │       ├── TuningScreens.kt                # Settings screen + test screen
+    │       └── theme/                          # Compose theme (Color, Theme, Typography)
     └── assets/
         └── face_landmarker.task                # MediaPipe face landmarker model
 ```
@@ -124,21 +146,25 @@ app/
 
 ### Blink Detection
 
-Uses EAR (Eye Aspect Ratio) computed from 6 landmarks per eye. The eye is considered closed when EAR drops below a fraction of an adaptive baseline. Blink duration determines the action:
+Uses EAR (Eye Aspect Ratio) computed from 6 landmarks per eye. The eye is considered closed when EAR drops below a fixed threshold (configurable, default 0.18). Blink duration determines the action:
 
 - **< 300ms** → natural blink (participates in double-blink detection)
 - **300–800ms** → ignored (anti-mistouch zone)
 - **≥ 800ms** → deliberate long blink (click)
 
-A double blink is two short blinks with a gap of roughly 80–700ms.
+A double blink is two short blinks with a gap of roughly 80–700ms. All these thresholds are adjustable in the settings screen.
 
 ### Head Direction
 
-Head direction is derived from the nose position relative to face width (horizontal) and face height (vertical). In crosshair mode, a narrower dead zone is used so small head tilts are enough to move the cursor.
+Head direction is derived from the nose position relative to face width (horizontal) and face height (vertical). The app maintains an adaptive center baseline to compensate for camera-position offsets, and re-calibrates quickly after a portrait/landscape switch.
 
 ### Mouth Open / Close
 
 Uses MAR (Mouth Aspect Ratio). The mouth is considered open when the ratio between lip distance and mouth width exceeds a threshold.
+
+### Physical Orientation Detection
+
+A gravity sensor reads the gravity vector to determine whether the device is physically in portrait or landscape, independent of the system rotation lock.
 
 ---
 
